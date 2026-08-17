@@ -1,0 +1,12 @@
+[build-system]
+requires = []
+build-backend = "backend"
+
+[project]
+name = "code-context-mcp-server"
+version = "0.1.0"
+description = "Local code-context MCP foundation"
+requires-python = ">=3.11"
+
+[project.scripts]
+code-context = "code_context.tools.mcp_tools:main"
