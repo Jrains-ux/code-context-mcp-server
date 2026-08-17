@@ -1,0 +1,3 @@
+- [x] 建立 published FTS 索引和查询服务。
+- [x] 提供 search / expand CLI。
+- [x] 完成 TDD、回归、编译和 OpenSpec 校验。

@@ -167,3 +167,17 @@ class SnapshotRepository:
                 "INSERT INTO conflict_reports(snapshot_id,code,detail_json) VALUES (?,?,?)",
                 (snapshot_id, code, json.dumps(detail, sort_keys=True)),
             )
+
+    def rebuild_node_index(self, snapshot_id):
+        rows = self.connection.execute(
+            "SELECT node_id,payload_json FROM nodes WHERE snapshot_id=?", (snapshot_id,)
+        ).fetchall()
+        with self.connection:
+            self.connection.execute("DELETE FROM node_fts WHERE snapshot_id=?", (str(snapshot_id),))
+            self.connection.executemany(
+                "INSERT INTO node_fts(node_id,snapshot_id,name,qualified_name,file_path,content_hash) VALUES (?,?,?,?,?,?)",
+                [
+                    (str(row[0]), str(snapshot_id), *(lambda payload: (payload.get("name", ""), payload.get("qualified_name", ""), payload.get("file_path", ""), payload.get("content_hash", "")))(json.loads(row[1])))
+                    for row in rows
+                ],
+            )

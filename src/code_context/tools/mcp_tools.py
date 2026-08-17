@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from code_context.bootstrap.first_build import BootstrapService
+from code_context.query import TechnicalQueryService
 from code_context.storage.repository import InitializationRepository
 from code_context.storage.repository import SnapshotRepository
 from code_context.storage.schema import Database
@@ -96,7 +97,7 @@ def health_result(connection, registry):
     }
 
 
-def run(command, database_path, manifest=None, source_root=None, scope=(), exclude=(), expected_parent=None):
+def run(command, database_path, manifest=None, source_root=None, scope=(), exclude=(), expected_parent=None, query=None, limit=20, node_ids=(), depth=1, node_budget=100, edge_budget=100):
     db = Database(database_path)
     try:
         db.migrate()
@@ -125,6 +126,14 @@ def run(command, database_path, manifest=None, source_root=None, scope=(), exclu
                 )
             except ValidationError as error:
                 return {"ok": False, "code": error.code}
+        if command in ("search", "expand"):
+            service = TechnicalQueryService(db.connection)
+            try:
+                if command == "search":
+                    return service.search(query, limit)
+                return service.expand(node_ids, depth, node_budget, edge_budget)
+            except ValidationError as error:
+                return {"ok": False, "code": error.code}
         return {"ok": False, "code": "UNKNOWN_COMMAND", "command": command}
     finally:
         db.close()
@@ -132,7 +141,7 @@ def run(command, database_path, manifest=None, source_root=None, scope=(), exclu
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="code-context")
-    parser.add_argument("command", choices=("init", "migrate", "doctor", "health", "bootstrap"))
+    parser.add_argument("command", choices=("init", "migrate", "doctor", "health", "bootstrap", "search", "expand"))
     parser.add_argument("--database", default=".code-context/context.db")
     parser.add_argument("--project", default="local")
     parser.add_argument("--workspace")
@@ -142,6 +151,12 @@ def main(argv=None):
     parser.add_argument("--scope", action="append", default=[])
     parser.add_argument("--exclude", action="append", default=[])
     parser.add_argument("--expected-parent", type=int)
+    parser.add_argument("--query")
+    parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--node-id", action="append", default=[], type=int)
+    parser.add_argument("--depth", type=int, default=1)
+    parser.add_argument("--node-budget", type=int, default=100)
+    parser.add_argument("--edge-budget", type=int, default=100)
     args = parser.parse_args(argv)
     manifest = None
     if args.command in ("init", "bootstrap"):
@@ -155,6 +170,8 @@ def main(argv=None):
     result = run(
         args.command, args.database, manifest=manifest, source_root=args.source_root,
         scope=args.scope, exclude=args.exclude, expected_parent=args.expected_parent,
+        query=args.query, limit=args.limit, node_ids=args.node_id, depth=args.depth,
+        node_budget=args.node_budget, edge_budget=args.edge_budget,
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0 if result.get("ok") else 1

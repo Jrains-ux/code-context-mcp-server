@@ -68,6 +68,7 @@ class BootstrapService:
                 {"expected_parent": expected_parent, "active_snapshot": active_snapshot_id},
             )
         SnapshotPublisher(self.repository).publish(snapshot_id)
+        self.repository.rebuild_node_index(snapshot_id)
         self.repository.complete_tasks(snapshot_id)
         return {
             "ok": True,

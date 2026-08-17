@@ -344,6 +344,33 @@ class FoundationTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(report[0], "ARTIFACT_CONFLICT")
 
+    def test_cli_search_returns_published_technical_node(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        source = root / "source"
+        source.mkdir()
+        (source / "sample.py").write_text("def lookup_order():\n    return 1\n", encoding="utf-8")
+        database_path = root / "context.db"
+        run("init", database_path)
+        run("bootstrap", database_path, manifest={"source_revision": "query-1", "config_version": "1"}, source_root=source, scope=["."])
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+        result = subprocess.run(
+            [sys.executable, "-m", "code_context.tools", "search", "--database", str(database_path), "--query", "lookup_order", "--limit", "5"],
+            capture_output=True, text=True, env=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["nodes"][0]["payload"]["name"], "lookup_order")
+
+    def test_search_rejects_missing_published_snapshot(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        database_path = Path(tmp.name) / "context.db"
+        run("init", database_path)
+        result = run("search", database_path, query="anything", limit=1)
+        self.assertEqual(result["code"], "SNAPSHOT_NOT_PUBLISHED")
+
     def test_doctor_reports_missing_registry_contract(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
