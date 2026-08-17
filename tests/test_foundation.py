@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from code_context.bootstrap.staging import SnapshotPublisher
+from code_context.business import BusinessRouter
 from code_context.policies.permission import PermissionMatrix
 from code_context.storage.repository import SnapshotRepository
 from code_context.storage.schema import Database
@@ -370,6 +371,27 @@ class FoundationTest(unittest.TestCase):
         run("init", database_path)
         result = run("search", database_path, query="anything", limit=1)
         self.assertEqual(result["code"], "SNAPSHOT_NOT_PUBLISHED")
+
+    def test_business_router_requires_selection_and_confirm_uses_evidence_cas(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "context.db")
+        self.addCleanup(db.close)
+        db.migrate()
+        repository = SnapshotRepository(db.connection)
+        snapshot_id = repository.create_snapshot("src", "idx", "1", "published")
+        repository.set_active_snapshot(snapshot_id)
+        router = BusinessRouter(db.connection)
+        router.add_candidate("refund", "orders.refund", "normal", "normal refund", [1], snapshot_id)
+        router.add_candidate("refund", "orders.refund", "fast", "fast refund", [2], snapshot_id)
+        resolved = router.resolve("refund")
+        self.assertEqual(resolved["status"], "needs_user_selection")
+        self.assertEqual(router.select(resolved["route_token"], "fast")["node_scope"], [2])
+        evidence_id = repository.add_evidence("src", "idx", "1", "a.py", 1, 1, "hash")
+        mapping_id = repository.add_mapping("orders.refund", snapshot_id, "candidate", evidence_id)
+        db.connection.execute("UPDATE mappings SET expected_version=1 WHERE mapping_id=?", (mapping_id,))
+        db.connection.commit()
+        self.assertEqual(router.confirm(mapping_id, 1, "confirmed", [evidence_id], "review")["status"], "confirmed")
 
     def test_doctor_reports_missing_registry_contract(self):
         tmp = tempfile.TemporaryDirectory()
