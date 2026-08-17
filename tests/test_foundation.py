@@ -393,6 +393,14 @@ class FoundationTest(unittest.TestCase):
         db.connection.commit()
         self.assertEqual(router.confirm(mapping_id, 1, "confirmed", [evidence_id], "review")["status"], "confirmed")
 
+    def test_sync_rejects_missing_baseline_snapshot(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        database_path = Path(tmp.name) / "context.db"
+        run("init", database_path)
+        result = run("sync", database_path)
+        self.assertEqual(result["code"], "BASELINE_REF_NOT_FOUND")
+
     def test_doctor_reports_missing_registry_contract(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
