@@ -217,6 +217,133 @@ class FoundationTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
 
+    def test_cli_bootstrap_builds_and_publishes_scoped_python_fixture(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        source_root = root / "source"
+        package = source_root / "pkg"
+        package.mkdir(parents=True)
+        (package / "sample.py").write_text(
+            "class Handler:\n    def run(self):\n        return 'ok'\n",
+            encoding="utf-8",
+        )
+        run("init", root / "context.db")
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "code_context.tools",
+                "bootstrap",
+                "--database",
+                str(root / "context.db"),
+                "--source-root",
+                str(source_root),
+                "--source-revision",
+                "rev-1",
+                "--scope",
+                "pkg",
+            ],
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "published")
+        self.assertGreater(payload["node_count"], 0)
+
+    def test_bootstrap_rejects_missing_source_revision(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        run("init", root / "context.db")
+        result = run(
+            "bootstrap",
+            root / "context.db",
+            manifest={"source_revision": "", "config_version": "1"},
+            source_root=root,
+            scope=["."],
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "SOURCE_REVISION_REQUIRED")
+
+    def test_bootstrap_retains_staging_snapshot_when_coverage_is_empty(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "source").mkdir()
+        run("init", root / "context.db")
+        result = run(
+            "bootstrap",
+            root / "context.db",
+            manifest={"source_revision": "rev-empty", "config_version": "1"},
+            source_root=root / "source",
+            scope=["missing"],
+        )
+        self.assertEqual(result["code"], "COVERAGE_GATE_FAILED")
+        db = Database(root / "context.db")
+        self.addCleanup(db.close)
+        snapshot = db.connection.execute(
+            "SELECT status FROM snapshots WHERE snapshot_id=?", (result["snapshot_id"],)
+        ).fetchone()
+        self.assertEqual(snapshot[0], "staging")
+        self.assertIsNone(SnapshotRepository(db.connection).get_active_snapshot_id())
+
+    def test_bootstrap_rejects_parent_mismatch_and_preserves_active_snapshot(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        source = root / "source"
+        source.mkdir()
+        (source / "sample.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+        database_path = root / "context.db"
+        run("init", database_path)
+        db = Database(database_path)
+        self.addCleanup(db.close)
+        repository = SnapshotRepository(db.connection)
+        active_id = repository.create_snapshot("old", "old-index", "1", "published")
+        repository.set_active_snapshot(active_id)
+        result = run(
+            "bootstrap",
+            database_path,
+            manifest={"source_revision": "rev-next", "config_version": "1"},
+            source_root=source,
+            scope=["."],
+            expected_parent=None,
+        )
+        self.assertEqual(result["code"], "PUBLISH_PARENT_MISMATCH")
+        self.assertEqual(repository.get_active_snapshot_id(), active_id)
+
+    def test_bootstrap_reports_duplicate_canonical_artifacts(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        source = root / "source"
+        source.mkdir()
+        (source / "duplicate.py").write_text(
+            "def run():\n    return 1\n\ndef run():\n    return 2\n",
+            encoding="utf-8",
+        )
+        database_path = root / "context.db"
+        run("init", database_path)
+        result = run(
+            "bootstrap",
+            database_path,
+            manifest={"source_revision": "rev-duplicate", "config_version": "1"},
+            source_root=source,
+            scope=["."],
+        )
+        self.assertEqual(result["code"], "ARTIFACT_CONFLICT")
+        db = Database(database_path)
+        self.addCleanup(db.close)
+        report = db.connection.execute(
+            "SELECT code FROM conflict_reports WHERE snapshot_id=?", (result["snapshot_id"],)
+        ).fetchone()
+        self.assertEqual(report[0], "ARTIFACT_CONFLICT")
+
     def test_doctor_reports_missing_registry_contract(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

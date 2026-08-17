@@ -2,9 +2,12 @@ import argparse
 import json
 from pathlib import Path
 
+from code_context.bootstrap.first_build import BootstrapService
 from code_context.storage.repository import InitializationRepository
+from code_context.storage.repository import SnapshotRepository
 from code_context.storage.schema import Database
 from code_context.tools.registry import ToolRegistry
+from code_context.validators.schema_validator import ValidationError
 
 
 def default_manifest(
@@ -93,7 +96,7 @@ def health_result(connection, registry):
     }
 
 
-def run(command, database_path, manifest=None):
+def run(command, database_path, manifest=None, source_root=None, scope=(), exclude=(), expected_parent=None):
     db = Database(database_path)
     try:
         db.migrate()
@@ -112,6 +115,16 @@ def run(command, database_path, manifest=None):
             return health_result(db.connection, registry)
         if command == "health":
             return health_result(db.connection, registry)
+        if command == "bootstrap":
+            if InitializationRepository(db.connection).get_manifest() is None:
+                return {"ok": False, "code": "SERVICE_NOT_READY"}
+            try:
+                return BootstrapService(SnapshotRepository(db.connection)).build(
+                    source_root, manifest["source_revision"], manifest["config_version"], scope,
+                    exclude=exclude, expected_parent=expected_parent,
+                )
+            except ValidationError as error:
+                return {"ok": False, "code": error.code}
         return {"ok": False, "code": "UNKNOWN_COMMAND", "command": command}
     finally:
         db.close()
@@ -119,15 +132,19 @@ def run(command, database_path, manifest=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="code-context")
-    parser.add_argument("command", choices=("init", "migrate", "doctor", "health"))
+    parser.add_argument("command", choices=("init", "migrate", "doctor", "health", "bootstrap"))
     parser.add_argument("--database", default=".code-context/context.db")
     parser.add_argument("--project", default="local")
     parser.add_argument("--workspace")
     parser.add_argument("--source-revision", default="unversioned")
     parser.add_argument("--config-version", default="1")
+    parser.add_argument("--source-root")
+    parser.add_argument("--scope", action="append", default=[])
+    parser.add_argument("--exclude", action="append", default=[])
+    parser.add_argument("--expected-parent", type=int)
     args = parser.parse_args(argv)
     manifest = None
-    if args.command == "init":
+    if args.command in ("init", "bootstrap"):
         manifest = default_manifest(
             args.database,
             project=args.project,
@@ -135,7 +152,10 @@ def main(argv=None):
             source_revision=args.source_revision,
             config_version=args.config_version,
         )
-    result = run(args.command, args.database, manifest=manifest)
+    result = run(
+        args.command, args.database, manifest=manifest, source_root=args.source_root,
+        scope=args.scope, exclude=args.exclude, expected_parent=args.expected_parent,
+    )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0 if result.get("ok") else 1
 

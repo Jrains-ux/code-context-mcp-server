@@ -142,3 +142,28 @@ class SnapshotRepository:
                 "UPDATE mappings SET replacement_evidence_id=?, status='candidate' WHERE mapping_id=?",
                 (evidence_id, mapping_id),
             )
+
+    def add_task_run(self, task_id, snapshot_id, scope, source_revision, status):
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO task_runs(task_id,snapshot_id,scope,source_revision,status) VALUES (?,?,?,?,?)",
+                (task_id, snapshot_id, scope, source_revision, status),
+            )
+
+    def complete_tasks(self, snapshot_id):
+        with self.connection:
+            self.connection.execute("UPDATE task_runs SET status='completed' WHERE snapshot_id=?", (snapshot_id,))
+
+    def add_artifact(self, snapshot_id, canonical_key, kind, content_hash, evidence_id, payload):
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO artifact_manifests(snapshot_id,canonical_key,kind,content_hash,evidence_id,payload_json) VALUES (?,?,?,?,?,?)",
+                (snapshot_id, canonical_key, kind, content_hash, evidence_id, json.dumps(payload, sort_keys=True)),
+            )
+
+    def add_conflict(self, snapshot_id, code, detail):
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO conflict_reports(snapshot_id,code,detail_json) VALUES (?,?,?)",
+                (snapshot_id, code, json.dumps(detail, sort_keys=True)),
+            )
