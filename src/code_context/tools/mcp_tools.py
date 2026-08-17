@@ -3,6 +3,9 @@ import json
 from pathlib import Path
 
 from code_context.bootstrap.first_build import BootstrapService
+from code_context.consumer import DistributionService
+from code_context.consumer import EvaluationService
+from code_context.consumer import KnowledgeService
 from code_context.query import TechnicalQueryService
 from code_context.sync import SyncService
 from code_context.storage.repository import InitializationRepository
@@ -98,7 +101,7 @@ def health_result(connection, registry):
     }
 
 
-def run(command, database_path, manifest=None, source_root=None, scope=(), exclude=(), expected_parent=None, query=None, limit=20, node_ids=(), depth=1, node_budget=100, edge_budget=100, operation_id=None, baseline_ref=None, target_source_revision=None):
+def run(command, database_path, manifest=None, source_root=None, scope=(), exclude=(), expected_parent=None, query=None, limit=20, node_ids=(), depth=1, node_budget=100, edge_budget=100, operation_id=None, baseline_ref=None, target_source_revision=None, dataset_id=None, golden_set_version=None, samples=(), minimum_samples=1, tool_versions=None, document_kind=None, document_scope=None, template_version=None, generator_version=None, manifest_id=None, target=None, idempotency_key=None):
     db = Database(database_path)
     try:
         db.migrate()
@@ -140,6 +143,21 @@ def run(command, database_path, manifest=None, source_root=None, scope=(), exclu
                 return SyncService(SnapshotRepository(db.connection)).update(operation_id or "default", baseline_ref, source_root, target_source_revision or "", manifest["config_version"] if manifest else "1", scope)
             except ValidationError as error:
                 return {"ok": False, "code": error.code}
+        if command == "evaluate":
+            try:
+                return EvaluationService(db.connection).evaluate(dataset_id, golden_set_version, samples, tool_versions, minimum_samples)
+            except ValidationError as error:
+                return {"ok": False, "code": error.code}
+        if command == "knowledge-generate":
+            try:
+                return KnowledgeService(db.connection).generate(document_kind, document_scope, template_version, generator_version)
+            except ValidationError as error:
+                return {"ok": False, "code": error.code}
+        if command == "knowledge-push":
+            try:
+                return DistributionService(db.connection).push(manifest_id, target, idempotency_key)
+            except ValidationError as error:
+                return {"ok": False, "code": error.code}
         return {"ok": False, "code": "UNKNOWN_COMMAND", "command": command}
     finally:
         db.close()
@@ -147,7 +165,7 @@ def run(command, database_path, manifest=None, source_root=None, scope=(), exclu
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="code-context")
-    parser.add_argument("command", choices=("init", "migrate", "doctor", "health", "bootstrap", "search", "expand", "sync"))
+    parser.add_argument("command", choices=("init", "migrate", "doctor", "health", "bootstrap", "search", "expand", "sync", "evaluate", "knowledge-generate", "knowledge-push"))
     parser.add_argument("--database", default=".code-context/context.db")
     parser.add_argument("--project", default="local")
     parser.add_argument("--workspace")
@@ -166,6 +184,18 @@ def main(argv=None):
     parser.add_argument("--operation-id")
     parser.add_argument("--baseline-ref", type=int)
     parser.add_argument("--target-source-revision")
+    parser.add_argument("--dataset-id")
+    parser.add_argument("--golden-set-version")
+    parser.add_argument("--samples-json", default="[]")
+    parser.add_argument("--minimum-samples", type=int, default=1)
+    parser.add_argument("--tool-versions-json", default="{}")
+    parser.add_argument("--document-kind")
+    parser.add_argument("--document-scope")
+    parser.add_argument("--template-version")
+    parser.add_argument("--generator-version")
+    parser.add_argument("--manifest-id")
+    parser.add_argument("--target")
+    parser.add_argument("--idempotency-key")
     args = parser.parse_args(argv)
     manifest = None
     if args.command in ("init", "bootstrap"):
@@ -182,6 +212,12 @@ def main(argv=None):
         query=args.query, limit=args.limit, node_ids=args.node_id, depth=args.depth,
         node_budget=args.node_budget, edge_budget=args.edge_budget,
         operation_id=args.operation_id, baseline_ref=args.baseline_ref, target_source_revision=args.target_source_revision,
+        dataset_id=args.dataset_id, golden_set_version=args.golden_set_version,
+        samples=json.loads(args.samples_json), minimum_samples=args.minimum_samples,
+        tool_versions=json.loads(args.tool_versions_json), document_kind=args.document_kind,
+        document_scope=args.document_scope, template_version=args.template_version,
+        generator_version=args.generator_version, manifest_id=args.manifest_id,
+        target=args.target, idempotency_key=args.idempotency_key,
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0 if result.get("ok") else 1

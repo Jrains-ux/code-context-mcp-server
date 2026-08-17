@@ -11,6 +11,9 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from code_context.bootstrap.staging import SnapshotPublisher
 from code_context.business import BusinessRouter
+from code_context.consumer import DistributionService
+from code_context.consumer import EvaluationService
+from code_context.consumer import KnowledgeService
 from code_context.policies.permission import PermissionMatrix
 from code_context.storage.repository import SnapshotRepository
 from code_context.storage.schema import Database
@@ -419,6 +422,108 @@ class FoundationTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         exit_code = main(["init", "--database", str(Path(tmp.name) / "context.db")])
         self.assertEqual(exit_code, 0)
+
+    def test_evaluation_rejects_insufficient_samples_without_persisting_metrics(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "context.db")
+        self.addCleanup(db.close)
+        db.migrate()
+        repository = SnapshotRepository(db.connection)
+        snapshot_id = repository.create_snapshot("src", "idx", "1", "staging")
+        repository.add_node(snapshot_id, "Behavior", "fixture", "src", "idx", "1", {"name": "lookup_order"})
+        SnapshotPublisher(repository).publish(snapshot_id)
+        repository.rebuild_node_index(snapshot_id)
+        with self.assertRaises(ValidationError) as error:
+            EvaluationService(db.connection).evaluate(
+                "dataset-1", "gold-1", [{"query": "lookup_order", "expected_node_ids": [1]}], minimum_samples=2,
+            )
+        self.assertEqual(error.exception.code, "EVALUATION_INSUFFICIENT")
+        self.assertEqual(db.connection.execute("SELECT count(*) FROM evaluation_runs").fetchone()[0], 0)
+
+    def test_evaluation_persists_version_bound_metrics_and_failure_cases(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "context.db")
+        self.addCleanup(db.close)
+        db.migrate()
+        repository = SnapshotRepository(db.connection)
+        snapshot_id = repository.create_snapshot("src", "idx", "1", "staging")
+        node_id = repository.add_node(snapshot_id, "Behavior", "fixture", "src", "idx", "1", {"name": "lookup_order"})
+        SnapshotPublisher(repository).publish(snapshot_id)
+        repository.rebuild_node_index(snapshot_id)
+        result = EvaluationService(db.connection).evaluate(
+            "dataset-1", "gold-1",
+            [{"query": "lookup_order", "expected_node_ids": [node_id]}, {"query": "lookup_order", "expected_node_ids": [999]}],
+            tool_versions={"search": "1"}, minimum_samples=2,
+        )
+        self.assertEqual(result["metrics"]["total"], 2)
+        self.assertEqual(result["metrics"]["passed"], 1)
+        row = db.connection.execute("SELECT source_revision, index_revision FROM evaluation_runs WHERE run_id=?", (result["run_id"],)).fetchone()
+        self.assertEqual(tuple(row), ("src", "idx"))
+        self.assertEqual(db.connection.execute("SELECT count(*) FROM failure_cases WHERE run_id=?", (result["run_id"],)).fetchone()[0], 1)
+
+    def test_knowledge_generation_uses_published_snapshot_and_confirmed_mapping_only(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "context.db")
+        self.addCleanup(db.close)
+        db.migrate()
+        repository = SnapshotRepository(db.connection)
+        snapshot_id = repository.create_snapshot("src", "idx", "1", "staging")
+        evidence_id = repository.add_evidence("src", "idx", "1", "fixture.py", 1, 1, "evidence")
+        repository.add_node(snapshot_id, "Behavior", "fixture", "src", "idx", "1", {"name": "lookup_order", "evidence_id": evidence_id})
+        SnapshotPublisher(repository).publish(snapshot_id)
+        candidate_mapping = repository.add_mapping("orders.refund", snapshot_id, "candidate", evidence_id)
+        technical = KnowledgeService(db.connection).generate("technical", "all", "template-1", "generator-1")
+        self.assertEqual(technical["snapshot_ref"]["index_revision"], "idx")
+        manifest = db.connection.execute("SELECT content_hash, evidence_refs_json FROM document_manifests WHERE manifest_id=?", (technical["manifest_id"],)).fetchone()
+        self.assertEqual(manifest[0], technical["content_hash"])
+        self.assertIn(str(evidence_id), manifest[1])
+        with self.assertRaises(ValidationError) as error:
+            KnowledgeService(db.connection).generate("business", str(candidate_mapping), "template-1", "generator-1")
+        self.assertEqual(error.exception.code, "CONFIRMED_MAPPING_REQUIRED")
+
+    def test_distribution_is_idempotent_and_unsupported_target_is_retryable_without_graph_mutation(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "context.db")
+        self.addCleanup(db.close)
+        db.migrate()
+        repository = SnapshotRepository(db.connection)
+        snapshot_id = repository.create_snapshot("src", "idx", "1", "staging")
+        repository.add_node(snapshot_id, "Behavior", "fixture", "src", "idx", "1", {"name": "lookup_order"})
+        SnapshotPublisher(repository).publish(snapshot_id)
+        document = KnowledgeService(db.connection).generate("technical", "all", "template-1", "generator-1")
+        counts_before = tuple(db.connection.execute("SELECT (SELECT count(*) FROM nodes), (SELECT count(*) FROM mappings), (SELECT count(*) FROM snapshots)").fetchone())
+        distribution = DistributionService(db.connection)
+        first = distribution.push(document["manifest_id"], "local", "push-1")
+        repeated = distribution.push(document["manifest_id"], "local", "push-1")
+        failed = distribution.push(document["manifest_id"], "feishu-wiki", "push-2")
+        self.assertEqual(first, repeated)
+        self.assertEqual(first["status"], "pushed")
+        self.assertEqual(failed["code"], "DISTRIBUTION_TARGET_UNSUPPORTED")
+        self.assertTrue(failed["retryable"])
+        self.assertEqual(tuple(db.connection.execute("SELECT (SELECT count(*) FROM nodes), (SELECT count(*) FROM mappings), (SELECT count(*) FROM snapshots)").fetchone()), counts_before)
+
+    def test_cli_run_exposes_evaluation_knowledge_and_controlled_push(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        database_path = Path(tmp.name) / "context.db"
+        run("init", database_path)
+        db = Database(database_path)
+        self.addCleanup(db.close)
+        repository = SnapshotRepository(db.connection)
+        snapshot_id = repository.create_snapshot("src", "idx", "1", "staging")
+        node_id = repository.add_node(snapshot_id, "Behavior", "fixture", "src", "idx", "1", {"name": "lookup_order"})
+        SnapshotPublisher(repository).publish(snapshot_id)
+        repository.rebuild_node_index(snapshot_id)
+        evaluation = run("evaluate", database_path, dataset_id="dataset-1", golden_set_version="gold-1", samples=[{"query": "lookup_order", "expected_node_ids": [node_id]}], minimum_samples=1)
+        document = run("knowledge-generate", database_path, document_kind="technical", document_scope="all", template_version="template-1", generator_version="generator-1")
+        pushed = run("knowledge-push", database_path, manifest_id=document["manifest_id"], target="local", idempotency_key="push-1")
+        self.assertTrue(evaluation["ok"])
+        self.assertTrue(document["ok"])
+        self.assertEqual(pushed["status"], "pushed")
 
 
 if __name__ == "__main__":
