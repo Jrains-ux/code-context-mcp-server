@@ -1,6 +1,48 @@
 import json
 
 
+class InitializationRepository:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def save_manifest(self, manifest):
+        skills_json = json.dumps(manifest["skills"], sort_keys=True)
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO initialization_manifest(singleton,project,workspace,source_revision,config_version,skills_json) "
+                "VALUES (1,?,?,?,?,?) "
+                "ON CONFLICT(singleton) DO UPDATE SET project=excluded.project,workspace=excluded.workspace,"
+                "source_revision=excluded.source_revision,config_version=excluded.config_version,skills_json=excluded.skills_json",
+                (
+                    manifest["project"],
+                    manifest["workspace"],
+                    manifest["source_revision"],
+                    manifest["config_version"],
+                    skills_json,
+                ),
+            )
+            self.connection.execute("DELETE FROM manifest_tool_permissions")
+            self.connection.executemany(
+                "INSERT INTO manifest_tool_permissions(skill,tool_name) VALUES (?,?)",
+                [
+                    (skill, tool)
+                    for skill, tools in manifest["skills"].items()
+                    for tool in tools
+                ],
+            )
+
+    def get_manifest(self):
+        row = self.connection.execute(
+            "SELECT project,workspace,source_revision,config_version,skills_json "
+            "FROM initialization_manifest WHERE singleton=1"
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["skills"] = json.loads(result.pop("skills_json"))
+        return result
+
+
 class SnapshotRepository:
     def __init__(self, connection):
         self.connection = connection

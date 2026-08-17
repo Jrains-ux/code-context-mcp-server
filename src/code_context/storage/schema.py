@@ -15,12 +15,15 @@ class Database:
         return self._connection
 
     def migrate(self):
-        migration_path = Path(__file__).parents[3] / "migrations" / "001_initial.sql"
+        migration_root = Path(__file__).parents[3] / "migrations"
         with self._connection:
-            self._connection.executescript(migration_path.read_text(encoding="utf-8"))
-            self._connection.execute(
-                "INSERT OR IGNORE INTO schema_migrations(version) VALUES (1)"
-            )
+            for migration_path in sorted(migration_root.glob("[0-9][0-9][0-9]_*.sql")):
+                version = int(migration_path.name.split("_", 1)[0])
+                self._connection.executescript(migration_path.read_text(encoding="utf-8"))
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",
+                    (version,),
+                )
 
     def close(self):
         self._connection.close()

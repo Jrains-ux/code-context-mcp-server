@@ -1,5 +1,7 @@
 import json
+import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -123,21 +125,110 @@ class FoundationTest(unittest.TestCase):
     def test_init_creates_database_and_registry(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        result = run("init", Path(tmp.name) / "context.db")
+        database_path = Path(tmp.name) / "context.db"
+        result = run("init", database_path)
         self.assertTrue(result["ok"])
-        self.assertEqual(run("doctor", Path(tmp.name) / "context.db")["status"], "healthy")
+        doctor = run("doctor", database_path)
+        self.assertEqual(doctor["status"], "not_ready")
+        self.assertEqual(doctor["code"], "SERVICE_NOT_READY")
+
+    def test_init_persists_default_local_manifest(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        result = run("init", Path(tmp.name) / "context.db")
+        self.assertIn("manifest", result)
+        self.assertEqual(result["manifest"]["project"], "local")
+        self.assertEqual(result["manifest"]["source_revision"], "unversioned")
+
+    def test_health_fails_closed_before_a_snapshot_is_published(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        database_path = Path(tmp.name) / "context.db"
+        run("init", database_path)
+        result = run("health", database_path)
+        self.assertEqual(result["code"], "SERVICE_NOT_READY")
+
+    def test_health_is_ready_after_initialized_fixture_is_published(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        database_path = Path(tmp.name) / "context.db"
+        run("init", database_path)
+        db = Database(database_path)
+        self.addCleanup(db.close)
+        repository = SnapshotRepository(db.connection)
+        snapshot_id = repository.create_snapshot("src-1", "idx-1", "cfg-1", "staging")
+        repository.add_node(snapshot_id, "Behavior", "fixture", "src-1", "idx-1", "cfg-1", {})
+        SnapshotPublisher(repository).publish(snapshot_id)
+        result = run("health", database_path)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["runtime_ready"])
+        self.assertEqual(repository.get_active_snapshot_id(), snapshot_id)
+
+    def test_cli_init_accepts_explicit_manifest_values(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        database_path = Path(tmp.name) / "context.db"
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "code_context.tools",
+                "init",
+                "--database",
+                str(database_path),
+                "--project",
+                "demo",
+                "--workspace",
+                "C:/workspace/demo",
+                "--source-revision",
+                "abc123",
+                "--config-version",
+                "2",
+            ],
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["manifest"]["project"], "demo")
+
+    def test_cli_init_rejects_blank_project_manifest_value(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        database_path = Path(tmp.name) / "context.db"
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "code_context.tools",
+                "init",
+                "--database",
+                str(database_path),
+                "--project",
+                "",
+            ],
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        self.assertEqual(result.returncode, 1)
 
     def test_doctor_reports_missing_registry_contract(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        db = Database(Path(tmp.name) / "context.db")
+        database_path = Path(tmp.name) / "context.db"
+        run("init", database_path)
+        db = Database(database_path)
         self.addCleanup(db.close)
-        db.migrate()
         db.connection.execute("DELETE FROM tool_registry")
         db.connection.commit()
-        result = run("doctor", Path(tmp.name) / "context.db")
+        result = run("doctor", database_path)
         self.assertFalse(result["ok"])
-        self.assertEqual(result["code"], "TOOL_CONTRACT_MISSING")
+        self.assertEqual(result["code"], "TOOL_PERMISSION_MISMATCH")
 
     def test_cli_main_returns_success_for_init(self):
         tmp = tempfile.TemporaryDirectory()
