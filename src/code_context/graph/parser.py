@@ -1,10 +1,11 @@
 """Python AST adapter for deterministic technical graph artifacts."""
 
 import ast
+import re
 from pathlib import Path
 from typing import Any, Protocol, Sequence, runtime_checkable
 
-from .artifacts import EdgeArtifact, GraphArtifact, NodeArtifact, SourceEvidence, SourceLocation
+from .artifacts import EdgeArtifact, GraphArtifact, GraphDiagnostic, NodeArtifact, SourceEvidence, SourceLocation
 
 
 @runtime_checkable
@@ -34,11 +35,11 @@ class ParserRegistry:
             self.register(parser)
 
     def register(self, parser: GraphParser) -> None:
-        for extension in parser.supported_extensions:
-            suffix = self._normalize_suffix(extension)
-            if suffix in self._parsers:
-                raise ValueError(f"parser suffix already registered: {suffix}")
-            self._parsers[suffix] = parser
+        normalized = [self._normalize_suffix(extension) for extension in parser.supported_extensions]
+        conflicts = [suffix for suffix in normalized if suffix in self._parsers]
+        if conflicts:
+            raise ValueError(f"parser suffix already registered: {sorted(conflicts)[0]}")
+        self._parsers.update({suffix: parser for suffix in normalized})
 
     def detect(self, path: str | Path) -> GraphParser | None:
         name = Path(path).name.lower()
@@ -56,8 +57,6 @@ class ParserRegistry:
         snapshot_revision: str,
         config_revision: str = "",
     ) -> GraphArtifact:
-        from .artifacts import GraphDiagnostic
-
         parser = self.detect(path)
         if parser is None:
             return GraphArtifact(
@@ -69,12 +68,23 @@ class ParserRegistry:
                     {"suffix": Path(path).suffix.lower()},
                 ),),
             )
-        return parser.parse(
-            path, source,
-            source_revision=source_revision,
-            snapshot_revision=snapshot_revision,
-            config_revision=config_revision,
-        )
+        try:
+            return parser.parse(
+                path, source,
+                source_revision=source_revision,
+                snapshot_revision=snapshot_revision,
+                config_revision=config_revision,
+            )
+        except SyntaxError as error:
+            return GraphArtifact(
+                (), (), source_revision, snapshot_revision,
+                (GraphDiagnostic(
+                    f"{parser.language.upper()}_SYNTAX_ERROR",
+                    str(path),
+                    str(error),
+                    {"line": error.lineno, "column": error.offset},
+                ),),
+            )
 
     @staticmethod
     def _normalize_suffix(suffix: str) -> str:
@@ -102,7 +112,11 @@ class PythonGraphParser:
         file_path = Path(path)
         module_name = self._module_name(file_path)
         tree = ast.parse(source, filename=str(file_path))
-        evidence = SourceEvidence(source_revision, snapshot_revision, config_revision)
+        evidence = SourceEvidence(
+            source_revision, snapshot_revision, config_revision,
+            parser=self.parser_id,
+            metadata={"parser_id": self.parser_id, "parser_version": self.version, "language": self.language},
+        )
         nodes: list[NodeArtifact] = []
         edges: list[EdgeArtifact] = []
         module_key = f"module:{module_name}"
@@ -200,6 +214,9 @@ class PythonGraphParser:
                 "extraction_method": "ast",
                 "evidence_level": "observed",
                 "parse_quality": "complete",
+                "sub_kind": kind,
+                "roles": ("container",) if kind == "module" else (("type",) if kind == "class" else ("callable",)),
+                "purpose": "source declaration",
             },
         )
 
@@ -213,6 +230,9 @@ class PythonGraphParser:
                 "extraction_method": "ast",
                 "evidence_level": "observed",
                 "parse_quality": "complete",
+                "sub_kind": edge_type,
+                "roles": ("relation",),
+                "purpose": "source relationship",
                 **(payload or {}),
             },
         )
@@ -279,3 +299,207 @@ class PythonGraphParser:
         for handler in getattr(statement, "handlers", []):
             if handler.body:
                 yield handler.body
+
+
+class _HeuristicGraphParser:
+    """Small, dependency-free declaration scanner shared by the basic parsers."""
+
+    parser_id = "heuristic"
+    version = "1"
+    language = ""
+    supported_extensions = frozenset()
+
+    _declaration_patterns = ()
+
+    def parse(self, path, source, *, source_revision, snapshot_revision, config_revision=""):
+        file_path = Path(path)
+        evidence = SourceEvidence(
+            source_revision, snapshot_revision, config_revision,
+            parser=self.parser_id,
+            confidence="medium",
+            metadata={"parser_id": self.parser_id, "parser_version": self.version, "language": self.language},
+        )
+        if not source.strip():
+            return GraphArtifact((), (), source_revision, snapshot_revision)
+
+        lines = source.splitlines()
+        quality = "complete" if self._balanced(source) else "partial"
+        root_kind, root_name = self._root(file_path, lines)
+        root_key = f"{root_kind}:{root_name}"
+        nodes = [self._node(root_kind, root_key, root_name, 1, file_path, evidence, snapshot_revision, quality)]
+        edges = []
+        symbols = {}
+        declarations = []
+        imports = []
+
+        for line_number, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("//", "#", "/*", "*")):
+                continue
+            for kind, name, extra in self._declarations(stripped):
+                key = f"{kind}:{root_name}.{name}"
+                if key not in {node.canonical_key for node in nodes}:
+                    nodes.append(self._node(kind, key, name, line_number, file_path, evidence, snapshot_revision, quality, extra))
+                    edges.append(self._edge("contains", root_key, key, line_number, file_path, evidence, snapshot_revision, quality=quality))
+                symbols[name] = key
+                declarations.append((kind, name, key, extra, line_number))
+            for imported in self._imports(stripped):
+                imports.append((imported, line_number))
+
+        for imported, line_number in imports:
+            import_name = imported.rsplit(".", 1)[-1].split("/", 1)[-1]
+            import_key = f"import:{root_name}.{import_name}"
+            nodes.append(self._node("import", import_key, imported, line_number, file_path, evidence, snapshot_revision, quality, {"import": imported}))
+            edges.append(self._edge("imports", root_key, import_key, line_number, file_path, evidence, snapshot_revision, {"import": imported, "resolution": "external"}, quality))
+
+        for kind, name, key, extra, line_number in declarations:
+            for relation in ("extends", "implements"):
+                for target_name in extra.get(relation, ()):
+                    target_key = symbols.get(target_name, f"external:{target_name}")
+                    edges.append(self._edge(relation, key, target_key, line_number, file_path, evidence, snapshot_revision, {"symbol": target_name, "resolution": "static" if target_name in symbols else "external"}, quality))
+            if kind in {"function", "method"}:
+                body = self._body_after_declaration(lines, line_number)
+                for called in self._calls(body):
+                    target_key = symbols.get(called, f"external:{called}")
+                    edges.append(self._edge("calls", key, target_key, line_number, file_path, evidence, snapshot_revision, {"symbol": called, "resolution": "static" if called in symbols else "external"}, quality))
+
+        for kind, name, key, _extra, line_number in declarations:
+            if self.language in {"javascript", "typescript"} and any(line.strip().startswith("export") and name in line for line in lines[line_number - 1:line_number]):
+                export_key = f"export:{root_name}.{name}"
+                nodes.append(self._node("export", export_key, name, line_number, file_path, evidence, snapshot_revision, quality))
+                edges.append(self._edge("defines", export_key, key, line_number, file_path, evidence, snapshot_revision, quality=quality))
+
+        diagnostics = ()
+        if quality == "partial":
+            diagnostics = (GraphDiagnostic(
+                "HEURISTIC_PARSE_PARTIAL", str(file_path),
+                "heuristic parser found unbalanced delimiters; extracted declarations are partial",
+                {"language": self.language, "parse_quality": quality},
+            ),)
+        return GraphArtifact(tuple(nodes), tuple(edges), source_revision, snapshot_revision, diagnostics)
+
+    def _declarations(self, line):
+        result = []
+        for pattern, kind in self._declaration_patterns:
+            match = pattern.search(line)
+            if not match:
+                continue
+            name = match.group("name")
+            extra = {}
+            for relation in ("extends", "implements"):
+                value = match.groupdict().get(relation)
+                if value:
+                    extra[relation] = tuple(item.strip() for item in value.split(",") if item.strip())
+            result.append((kind, name, extra))
+            break
+        return result
+
+    @staticmethod
+    def _balanced(source):
+        pairs = {"{": "}", "(": ")", "[": "]"}
+        stack = []
+        for char in source:
+            if char in pairs:
+                stack.append(pairs[char])
+            elif char in pairs.values():
+                if not stack or stack.pop() != char:
+                    return False
+        return not stack
+
+    @staticmethod
+    def _body_after_declaration(lines, line_number):
+        return "\n".join(lines[line_number - 1:line_number + 20])
+
+    @staticmethod
+    def _calls(text):
+        ignored = {"if", "for", "while", "switch", "catch", "func", "function", "class", "interface", "new", "return"}
+        constructors = re.findall(r"\bnew\s+([A-Za-z_$][\w$]*)\s*\(", text)
+        calls = re.findall(r"\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\(", text)
+        return tuple(dict.fromkeys(name for name in (*constructors, *calls) if name not in ignored))
+
+    def _imports(self, line):
+        return ()
+
+    def _root(self, path, lines):
+        return "module", path.with_suffix("").as_posix().replace("/", ".")
+
+    @staticmethod
+    def _node(kind, key, name, line_number, path, evidence, snapshot, quality, extra=None):
+        roles = {"module": ("container",), "package": ("container",), "import": ("dependency",), "export": ("api",), "class": ("type",), "interface": ("contract",), "struct": ("type",), "enum": ("type",), "function": ("callable",), "method": ("callable",)}.get(kind, ("code",))
+        return NodeArtifact(
+            kind, key, name, SourceLocation(str(path), line_number, 0), evidence, snapshot,
+            {"name": name, "qualified_name": key.split(":", 1)[1], "language": evidence.metadata["language"],
+             "extraction_method": "heuristic", "evidence_level": "static_analysis", "parse_quality": quality,
+             "sub_kind": kind, "roles": roles, "purpose": "source declaration", **(extra or {})},
+        )
+
+    @staticmethod
+    def _edge(edge_type, source, target, line_number, path, evidence, snapshot, extra=None, quality="complete"):
+        return EdgeArtifact(
+            edge_type, source, target, SourceLocation(str(path), line_number, 0), evidence, snapshot,
+            {"language": evidence.metadata["language"], "extraction_method": "heuristic", "evidence_level": "static_analysis",
+             "parse_quality": quality, "sub_kind": edge_type, "roles": ("relation",), "purpose": "source relationship",
+             "resolution": "static", **(extra or {})},
+        )
+
+
+class JavaGraphParser(_HeuristicGraphParser):
+    parser_id = "java-heuristic"
+    language = "java"
+    supported_extensions = frozenset({".java"})
+    _declaration_patterns = (
+        (re.compile(r"\binterface\s+(?P<name>[A-Za-z_$][\w$]*)"), "interface"),
+        (re.compile(r"\benum\s+(?P<name>[A-Za-z_$][\w$]*)"), "enum"),
+        (re.compile(r"\bclass\s+(?P<name>[A-Za-z_$][\w$]*)(?:\s+extends\s+(?P<extends>[\w$]+))?(?:\s+implements\s+(?P<implements>[\w$,. ]+))?"), "class"),
+        (re.compile(r"\b(?!(?:new|return)\b)(?:public|private|protected|static|final|abstract|synchronized|native\s+)*[\w$<>\[\],.?]+\s+(?P<name>[A-Za-z_$][\w$]*)\s*\([^;]*\)"), "method"),
+    )
+
+    def _imports(self, line):
+        match = re.search(r"\bimport\s+(?:static\s+)?([\w$.]+)", line)
+        return (match.group(1),) if match else ()
+
+    def _root(self, path, lines):
+        match = next((re.search(r"\bpackage\s+([\w.]+)", line) for line in lines if re.search(r"\bpackage\s+([\w.]+)", line)), None)
+        return "package", match.group(1) if match else path.with_suffix("").as_posix().replace("/", ".")
+
+
+class GoGraphParser(_HeuristicGraphParser):
+    parser_id = "go-heuristic"
+    language = "go"
+    supported_extensions = frozenset({".go"})
+    _declaration_patterns = (
+        (re.compile(r"\btype\s+(?P<name>\w+)\s+struct\b"), "struct"),
+        (re.compile(r"\btype\s+(?P<name>\w+)\s+interface\b"), "interface"),
+        (re.compile(r"\bfunc\s*\([^)]*\)\s*(?P<name>\w+)\s*\("), "method"),
+        (re.compile(r"\bfunc\s+(?P<name>\w+)\s*\("), "function"),
+    )
+
+    def _imports(self, line):
+        return tuple(re.findall(r"\bimport\s+(?:\w+\s+)?\"([^\"]+)\"", line))
+
+    def _root(self, path, lines):
+        match = next((re.search(r"\bpackage\s+(\w+)", line) for line in lines if re.search(r"\bpackage\s+(\w+)", line)), None)
+        return "package", match.group(1) if match else path.stem
+
+
+class JavaScriptGraphParser(_HeuristicGraphParser):
+    parser_id = "javascript-heuristic"
+    language = "javascript"
+    supported_extensions = frozenset({".js", ".jsx", ".ts", ".tsx"})
+    _declaration_patterns = (
+        (re.compile(r"\binterface\s+(?P<name>[A-Za-z_$][\w$]*)"), "interface"),
+        (re.compile(r"\bclass\s+(?P<name>[A-Za-z_$][\w$]*)(?:\s+extends\s+(?P<extends>[\w$]+))?(?:\s+implements\s+(?P<implements>[\w$,. ]+))?"), "class"),
+        (re.compile(r"\bfunction\s+(?P<name>[A-Za-z_$][\w$]*)\s*\("), "function"),
+        (re.compile(r"^\s*(?:public|private|protected|static|async|get|set)?\s*(?P<name>[A-Za-z_$][\w$]*)\s*\([^;]*\)\s*[{:]"), "method"),
+    )
+
+    def parse(self, path, source, *, source_revision, snapshot_revision, config_revision=""):
+        self.language = "typescript" if Path(path).suffix.lower() in {".ts", ".tsx"} else "javascript"
+        return super().parse(path, source, source_revision=source_revision, snapshot_revision=snapshot_revision, config_revision=config_revision)
+
+    def _imports(self, line):
+        match = re.search(r"\bimport\s+(?:.+?\s+from\s+)?[\'\"]([^\'\"]+)[\'\"]", line)
+        return (match.group(1),) if match else ()
+
+    def _root(self, path, lines):
+        return "module", path.with_suffix("").as_posix().replace("/", ".")
