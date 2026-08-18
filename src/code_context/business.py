@@ -30,14 +30,21 @@ class BusinessRouter:
             if candidate["context_id"] == context_id: return {"ok": True, "status": "selected", **candidate, "route_token": token}
         raise ValidationError("CONTEXT_SELECTION_REQUIRED", "context is not a token candidate")
 
-    def confirm(self, mapping_id, expected_version, decision, evidence_refs, reason):
+    def confirm(self, mapping_id, expected_version, decision, evidence_refs, reason,
+                review_mode=None, updated_by=None):
         if decision not in ("confirmed", "rejected") or not evidence_refs: raise ValidationError("EVIDENCE_REQUIRED", "evidence is required")
         mapping = self.connection.execute("SELECT * FROM mappings WHERE mapping_id=?", (mapping_id,)).fetchone()
         if mapping is None or mapping[4] != expected_version: raise ValidationError("CAS_VERSION_MISMATCH", "mapping version mismatch")
         if mapping[3] == "stale" and decision == "confirmed": raise ValidationError("CAS_VERSION_MISMATCH", "stale mapping cannot be restored")
         with self.connection:
-            self.connection.execute("UPDATE mappings SET status=?,expected_version=? WHERE mapping_id=?", (decision, expected_version + 1, mapping_id))
-            self.connection.execute("INSERT INTO confirmation_audit(mapping_id,decision,evidence_id,reason) VALUES (?,?,?,?)", (mapping_id, decision, evidence_refs[0], reason))
+            self.connection.execute(
+                "UPDATE mappings SET status=?,expected_version=?,evidence_id=?,evidence_refs_json=?,review_mode=COALESCE(?,review_mode),updated_by=?,updated_at=CURRENT_TIMESTAMP WHERE mapping_id=?",
+                (decision, expected_version + 1, evidence_refs[0], json.dumps(list(evidence_refs)), review_mode, updated_by, mapping_id),
+            )
+            self.connection.execute(
+                "INSERT INTO confirmation_audit(mapping_id,decision,evidence_id,reason,evidence_refs_json,review_mode,updated_by) VALUES (?,?,?,?,?,?,?)",
+                (mapping_id, decision, evidence_refs[0], reason, json.dumps(list(evidence_refs)), review_mode, updated_by),
+            )
         return {"ok": True, "status": decision}
 
     def _active(self):

@@ -27,12 +27,14 @@ class StdioDispatcher:
         "evaluate": "Evaluate technical query results against a golden set.",
         "knowledge-generate": "Generate a versioned knowledge artifact.",
         "knowledge-push": "Push a knowledge artifact to a configured target.",
+        "confirm": "Confirm or reject a business mapping with evidence and CAS.",
     }
 
     _METHODS = {
         "initialize": {"protocolVersion", "capabilities", "clientInfo"},
         "tools/list": {"cursor"},
         "tools/call": {"name", "arguments"},
+        "confirm": {"mapping_id", "expected_version", "decision", "evidence_refs", "reason", "review_mode", "updated_by", "database"},
         "search": {"query", "limit", "database"},
         "expand": {
             "node_ids", "depth", "node_budget", "edge_budget", "direction",

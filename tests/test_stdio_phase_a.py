@@ -62,6 +62,33 @@ class StdioDispatcherTests(unittest.TestCase):
         self.assertEqual(json.loads(response["result"]["content"][0]["text"]), {"ok": True, "nodes": []})
         runner.assert_called_once_with("search", "test.db", query="Handler", limit=3)
 
+    def test_confirm_tool_dispatches_mapping_evidence_and_review_fields(self):
+        from code_context.tools.stdio import StdioDispatcher
+
+        output = io.StringIO()
+        request = {
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {
+                "name": "confirm",
+                "arguments": {
+                    "database": "test.db", "mapping_id": 7, "expected_version": 1,
+                    "decision": "confirmed", "evidence_refs": [11, 12],
+                    "reason": "review", "review_mode": "manual_review_required",
+                    "updated_by": "reviewer",
+                },
+            },
+        }
+        with patch("code_context.tools.stdio.run", return_value={"ok": True, "status": "confirmed"}) as runner:
+            StdioDispatcher().serve(io.StringIO(json.dumps(request) + "\n"), output)
+
+        response = json.loads(output.getvalue())
+        self.assertEqual(response["result"]["isError"], False)
+        runner.assert_called_once_with(
+            "confirm", "test.db", mapping_id=7, expected_version=1,
+            decision="confirmed", evidence_refs=[11, 12], reason="review",
+            review_mode="manual_review_required", updated_by="reviewer",
+        )
+
     def test_search_request_returns_correlated_result(self):
         from code_context.tools.stdio import StdioDispatcher
 

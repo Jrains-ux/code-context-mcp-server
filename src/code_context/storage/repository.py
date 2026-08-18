@@ -263,17 +263,60 @@ class SnapshotRepository:
         with self.connection:
             self.connection.execute("UPDATE evidence SET snippet_hash=? WHERE evidence_id=?", (snippet_hash, evidence_id))
 
-    def add_mapping(self, biz_id, snapshot_id, status, evidence_id):
+    def add_business_node(self, snapshot_id, node_type, canonical_key, payload, status):
+        snapshot = self.get_snapshot(snapshot_id)
+        if snapshot is None:
+            raise ValidationError("SNAPSHOT_NOT_FOUND", "snapshot does not exist")
+        if status not in ("candidate", "confirmed", "rejected", "stale"):
+            raise ValidationError("BUSINESS_NODE_STATUS_INVALID", "invalid business node status")
         cursor = self.connection.execute(
-            "INSERT INTO mappings(biz_id,snapshot_id,status,evidence_id) VALUES (?,?,?,?)",
-            (biz_id, snapshot_id, status, evidence_id),
+            "INSERT INTO business_nodes(snapshot_id,node_type,canonical_key,payload_json,status,source_revision,index_revision,config_version) VALUES (?,?,?,?,?,?,?,?)",
+            (snapshot_id, node_type, canonical_key, json.dumps(payload, sort_keys=True), status, snapshot["source_revision"], snapshot["index_revision"], snapshot["config_version"]),
         )
         self.connection.commit()
         return cursor.lastrowid
 
+    def get_business_node(self, business_node_id):
+        row = self.connection.execute("SELECT * FROM business_nodes WHERE business_node_id=?", (business_node_id,)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["payload"] = json.loads(result.pop("payload_json"))
+        return result
+
+    def add_mapping(self, biz_id, snapshot_id, status, evidence_id, requirement_id=None,
+                    anchor_node_ids=None, evidence_refs=None, review_required=False,
+                    review_mode=None, risk_level=None, confidence=None,
+                    review_batch_id=None, updated_by=None):
+        evidence_refs = list(evidence_refs or ([evidence_id] if evidence_id is not None else []))
+        anchor_node_ids = list(anchor_node_ids or [])
+        cursor = self.connection.execute(
+            "INSERT INTO mappings(biz_id,snapshot_id,status,evidence_id,requirement_id,anchor_node_ids_json,evidence_refs_json,review_required,review_mode,risk_level,confidence,review_batch_id,updated_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (biz_id, snapshot_id, status, evidence_id, requirement_id, json.dumps(anchor_node_ids), json.dumps(evidence_refs), int(review_required), review_mode, risk_level, confidence, review_batch_id, updated_by),
+        )
+        mapping_id = cursor.lastrowid
+        self.connection.executemany(
+            "INSERT INTO mapping_evidence(mapping_id,evidence_id,created_by) VALUES (?,?,?)",
+            [(mapping_id, ref, updated_by) for ref in evidence_refs],
+        )
+        self.connection.commit()
+        return mapping_id
+
     def get_mapping(self, mapping_id):
         row = self.connection.execute("SELECT * FROM mappings WHERE mapping_id=?", (mapping_id,)).fetchone()
-        return None if row is None else dict(row)
+        if row is None:
+            return None
+        result = dict(row)
+        for field in ("anchor_node_ids_json", "evidence_refs_json"):
+            result[field.removesuffix("_json")] = json.loads(result.pop(field))
+        return result
+
+    def get_mapping_evidence(self, mapping_id):
+        rows = self.connection.execute(
+            "SELECT evidence_id FROM mapping_evidence WHERE mapping_id=? ORDER BY evidence_id",
+            (mapping_id,),
+        ).fetchall()
+        return [row[0] for row in rows]
 
     def replace_mapping_evidence(self, mapping_id, evidence_id):
         with self.connection:
