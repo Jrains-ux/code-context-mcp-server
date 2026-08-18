@@ -1,5 +1,7 @@
 import json
 
+from code_context.validators.schema_validator import require_same_revisions, ValidationError
+
 
 class InitializationRepository:
     def __init__(self, connection):
@@ -101,6 +103,143 @@ class SnapshotRepository:
         result = dict(row)
         result["payload"] = json.loads(result.pop("payload_json"))
         return result
+
+    def get_node_by_canonical_key(self, snapshot_id, canonical_key):
+        row = self.connection.execute(
+            "SELECT * FROM nodes WHERE snapshot_id=? AND canonical_key=?",
+            (snapshot_id, canonical_key),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["payload"] = json.loads(result.pop("payload_json"))
+        return result
+
+    def persist_graph_artifacts(self, snapshot_id, graph):
+        """Persist one parser result without intermediate commits."""
+        snapshot = self.get_snapshot(snapshot_id)
+        if snapshot is None:
+            raise ValidationError("SNAPSHOT_NOT_FOUND", "snapshot does not exist")
+        if snapshot["status"] != "staging":
+            raise ValidationError("SNAPSHOT_NOT_STAGING", "graph requires a staging snapshot")
+        if graph.source_revision != snapshot["source_revision"] or graph.snapshot_revision != snapshot["index_revision"]:
+            raise ValidationError("REVISION_MISMATCH", "graph revisions do not match snapshot")
+        keys = [node.canonical_key for node in graph.nodes]
+        if len(keys) != len(set(keys)):
+            raise ValidationError("ARTIFACT_CONFLICT", "duplicate node canonical key")
+        if any(not key for key in keys):
+            raise ValidationError("ARTIFACT_CONFLICT", "canonical key is required")
+        existing = self.connection.execute(
+            "SELECT canonical_key FROM nodes WHERE snapshot_id=? AND canonical_key IS NOT NULL",
+            (snapshot_id,),
+        ).fetchall()
+        if set(keys) & {row[0] for row in existing}:
+            raise ValidationError("ARTIFACT_CONFLICT", "canonical key already exists")
+
+        node_ids = {}
+        edge_keys = set()
+        with self.connection:
+            for node in graph.nodes:
+                require_same_revisions(snapshot, {
+                    "source_revision": node.evidence.source_revision,
+                    "index_revision": node.snapshot_revision,
+                    "config_version": node.evidence.config_revision or snapshot["config_version"],
+                })
+                evidence_id = self._insert_evidence(node.evidence, node.location, node.payload)
+                payload = self._artifact_payload(node.canonical_key, node.name, node.location, node.evidence, node.payload, evidence_id)
+                cursor = self.connection.execute(
+                    "INSERT INTO nodes(snapshot_id,kind,sub_kind,source_revision,index_revision,config_version,payload_json,canonical_key,evidence_id) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (snapshot_id, "Graph", node.kind, snapshot["source_revision"], snapshot["index_revision"], snapshot["config_version"], json.dumps(payload, sort_keys=True), node.canonical_key, evidence_id),
+                )
+                node_ids[node.canonical_key] = cursor.lastrowid
+                self.connection.execute(
+                    "INSERT INTO artifact_manifests(snapshot_id,canonical_key,kind,content_hash,evidence_id,payload_json) VALUES (?,?,?,?,?,?)",
+                    (snapshot_id, node.canonical_key, node.kind, self._content_hash(payload), evidence_id, json.dumps(payload, sort_keys=True)),
+                )
+
+            for edge in graph.edges:
+                require_same_revisions(snapshot, {
+                    "source_revision": edge.evidence.source_revision,
+                    "index_revision": edge.snapshot_revision,
+                    "config_version": edge.evidence.config_revision,
+                })
+                require_same_revisions(snapshot, {
+                    "source_revision": edge.evidence.source_revision,
+                    "index_revision": edge.evidence.snapshot_revision,
+                    "config_version": edge.evidence.config_revision,
+                })
+                edge_identity = (edge.edge_type, edge.source_key, edge.target_key, edge.location.path, edge.location.start_line)
+                if edge_identity in edge_keys:
+                    continue
+                edge_keys.add(edge_identity)
+                source_id = node_ids.get(edge.source_key) or self._ensure_external_node(snapshot_id, snapshot, edge.source_key, edge)
+                target_id = node_ids.get(edge.target_key) or self._ensure_external_node(snapshot_id, snapshot, edge.target_key, edge)
+                evidence_id = self._insert_evidence(edge.evidence, edge.location, edge.payload)
+                payload = self._artifact_payload(edge.edge_type, edge.edge_type, edge.location, edge.evidence, {**edge.payload, "source_key": edge.source_key, "target_key": edge.target_key}, evidence_id)
+                self.connection.execute(
+                    "INSERT INTO edges(snapshot_id,from_node_id,to_node_id,edge_type,source_revision,index_revision,config_version,payload_json,evidence_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (snapshot_id, source_id, target_id, edge.edge_type, snapshot["source_revision"], snapshot["index_revision"], snapshot["config_version"], json.dumps(payload, sort_keys=True), evidence_id),
+                )
+
+            self._rebuild_node_index_in_transaction(snapshot_id)
+        node_count = self.connection.execute(
+            "SELECT count(*) FROM nodes WHERE snapshot_id=?", (snapshot_id,)
+        ).fetchone()[0]
+        return {"node_count": node_count, "edge_count": len(edge_keys)}
+
+    @staticmethod
+    def _content_hash(payload):
+        import hashlib
+        return hashlib.sha256(json.dumps(dict(payload), sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _artifact_payload(canonical_key, name, location, evidence, payload, evidence_id):
+        result = dict(payload)
+        result.update({
+            "canonical_key": canonical_key,
+            "name": name,
+            "file_path": location.path,
+            "start_line": location.start_line,
+            "end_line": location.end_line,
+            "evidence_id": evidence_id,
+            "source_revision": evidence.source_revision,
+            "index_revision": evidence.snapshot_revision,
+            "config_version": evidence.config_revision,
+        })
+        return result
+
+    def _insert_evidence(self, evidence, location, payload):
+        cursor = self.connection.execute(
+            "INSERT INTO evidence(source_revision,index_revision,config_version,file_path,start_line,end_line,snippet_hash,parser,confidence,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (evidence.source_revision, evidence.snapshot_revision, evidence.config_revision, location.path, location.start_line, location.end_line or location.start_line, self._content_hash(payload), evidence.parser, evidence.confidence, json.dumps(dict(evidence.metadata), sort_keys=True, default=str)),
+        )
+        return cursor.lastrowid
+
+    def _ensure_external_node(self, snapshot_id, snapshot, canonical_key, edge):
+        existing = self.get_node_by_canonical_key(snapshot_id, f"external:{canonical_key}")
+        if existing:
+            return existing["node_id"]
+        external_key = f"external:{canonical_key}"
+        evidence_id = self._insert_evidence(edge.evidence, edge.location, edge.payload)
+        payload = self._artifact_payload(external_key, canonical_key, edge.location, edge.evidence, {"external": True}, evidence_id)
+        cursor = self.connection.execute(
+            "INSERT INTO nodes(snapshot_id,kind,sub_kind,source_revision,index_revision,config_version,payload_json,canonical_key,evidence_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            (snapshot_id, "Graph", "external", snapshot["source_revision"], snapshot["index_revision"], snapshot["config_version"], json.dumps(payload, sort_keys=True), external_key, evidence_id),
+        )
+        self.connection.execute(
+            "INSERT INTO artifact_manifests(snapshot_id,canonical_key,kind,content_hash,evidence_id,payload_json) VALUES (?,?,?,?,?,?)",
+            (snapshot_id, external_key, "external", self._content_hash(payload), evidence_id, json.dumps(payload, sort_keys=True)),
+        )
+        return cursor.lastrowid
+
+    def _rebuild_node_index_in_transaction(self, snapshot_id):
+        rows = self.connection.execute("SELECT node_id,payload_json FROM nodes WHERE snapshot_id=?", (snapshot_id,)).fetchall()
+        self.connection.execute("DELETE FROM node_fts WHERE snapshot_id=?", (str(snapshot_id),))
+        self.connection.executemany(
+            "INSERT INTO node_fts(node_id,snapshot_id,name,qualified_name,file_path,content_hash) VALUES (?,?,?,?,?,?)",
+            [(str(row[0]), str(snapshot_id), *(lambda payload: (payload.get("name", ""), payload.get("qualified_name", ""), payload.get("file_path", ""), payload.get("content_hash", "")))(json.loads(row[1]))) for row in rows],
+        )
 
     def add_edge(self, snapshot_id, from_node_id, to_node_id, edge_type, source_revision, index_revision, config_version, payload):
         cursor = self.connection.execute(

@@ -101,7 +101,7 @@ def health_result(connection, registry):
     }
 
 
-def run(command, database_path, manifest=None, source_root=None, scope=(), exclude=(), expected_parent=None, query=None, limit=20, node_ids=(), depth=1, node_budget=100, edge_budget=100, operation_id=None, baseline_ref=None, target_source_revision=None, dataset_id=None, golden_set_version=None, samples=(), minimum_samples=1, tool_versions=None, document_kind=None, document_scope=None, template_version=None, generator_version=None, manifest_id=None, target=None, idempotency_key=None):
+def run(command, database_path, manifest=None, source_root=None, scope=(), exclude=(), expected_parent=None, query=None, limit=20, node_ids=(), depth=1, node_budget=100, edge_budget=100, direction="out", edge_types=(), node_scope=None, operation_id=None, baseline_ref=None, target_source_revision=None, dataset_id=None, golden_set_version=None, samples=(), minimum_samples=1, tool_versions=None, document_kind=None, document_scope=None, template_version=None, generator_version=None, manifest_id=None, target=None, idempotency_key=None):
     db = Database(database_path)
     try:
         db.migrate()
@@ -135,7 +135,7 @@ def run(command, database_path, manifest=None, source_root=None, scope=(), exclu
             try:
                 if command == "search":
                     return service.search(query, limit)
-                return service.expand(node_ids, depth, node_budget, edge_budget)
+                return service.expand(node_ids, depth, node_budget, edge_budget, direction, edge_types, node_scope)
             except ValidationError as error:
                 return {"ok": False, "code": error.code}
         if command == "sync":
@@ -165,7 +165,7 @@ def run(command, database_path, manifest=None, source_root=None, scope=(), exclu
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="code-context")
-    parser.add_argument("command", choices=("init", "migrate", "doctor", "health", "bootstrap", "search", "expand", "sync", "evaluate", "knowledge-generate", "knowledge-push"))
+    parser.add_argument("command", choices=("init", "migrate", "doctor", "health", "bootstrap", "search", "expand", "stdio", "sync", "evaluate", "knowledge-generate", "knowledge-push"))
     parser.add_argument("--database", default=".code-context/context.db")
     parser.add_argument("--project", default="local")
     parser.add_argument("--workspace")
@@ -181,6 +181,9 @@ def main(argv=None):
     parser.add_argument("--depth", type=int, default=1)
     parser.add_argument("--node-budget", type=int, default=100)
     parser.add_argument("--edge-budget", type=int, default=100)
+    parser.add_argument("--direction", choices=("out", "in", "both"), default="out")
+    parser.add_argument("--edge-type", action="append", dest="edge_types", default=[])
+    parser.add_argument("--node-scope-json")
     parser.add_argument("--operation-id")
     parser.add_argument("--baseline-ref", type=int)
     parser.add_argument("--target-source-revision")
@@ -197,6 +200,10 @@ def main(argv=None):
     parser.add_argument("--target")
     parser.add_argument("--idempotency-key")
     args = parser.parse_args(argv)
+    if args.command == "stdio":
+        from code_context.tools.stdio import StdioDispatcher
+        StdioDispatcher(default_database=args.database).serve()
+        return 0
     manifest = None
     if args.command in ("init", "bootstrap"):
         manifest = default_manifest(
@@ -211,6 +218,8 @@ def main(argv=None):
         scope=args.scope, exclude=args.exclude, expected_parent=args.expected_parent,
         query=args.query, limit=args.limit, node_ids=args.node_id, depth=args.depth,
         node_budget=args.node_budget, edge_budget=args.edge_budget,
+        direction=args.direction, edge_types=args.edge_types,
+        node_scope=json.loads(args.node_scope_json) if args.node_scope_json else None,
         operation_id=args.operation_id, baseline_ref=args.baseline_ref, target_source_revision=args.target_source_revision,
         dataset_id=args.dataset_id, golden_set_version=args.golden_set_version,
         samples=json.loads(args.samples_json), minimum_samples=args.minimum_samples,

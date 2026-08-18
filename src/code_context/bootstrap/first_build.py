@@ -1,9 +1,10 @@
 import ast
 import hashlib
-import json
 from pathlib import Path
 
 from code_context.bootstrap.staging import SnapshotPublisher
+from code_context.graph.artifacts import GraphArtifact
+from code_context.graph.parser import PythonGraphParser
 from code_context.validators.schema_validator import ValidationError
 
 
@@ -33,49 +34,39 @@ class BootstrapService:
                 source_revision,
                 "running",
             )
-        artifacts = []
-        for file_path in files:
-            artifacts.extend(self._extract_file(source_root, file_path))
-        if not artifacts:
+        graphs = []
+        try:
+            for file_path in files:
+                source = file_path.read_text(encoding="utf-8")
+                graphs.append(PythonGraphParser().parse(
+                    file_path.relative_to(source_root), source,
+                    source_revision=source_revision,
+                    snapshot_revision=f"bootstrap-{source_revision}",
+                    config_revision=config_version,
+                ))
+        except (SyntaxError, UnicodeDecodeError, OSError) as error:
+            return self._reject(snapshot_id, "PARSE_FAILED", {"message": str(error)})
+        if not graphs:
             return self._reject(snapshot_id, "COVERAGE_GATE_FAILED", {"scope": list(scope)})
-        seen = set()
-        for artifact in artifacts:
-            if artifact["canonical_key"] in seen:
-                return self._reject(snapshot_id, "ARTIFACT_CONFLICT", artifact)
-            seen.add(artifact["canonical_key"])
-            evidence_id = self.repository.add_evidence(
-                source_revision,
-                f"bootstrap-{source_revision}",
-                config_version,
-                artifact["file_path"],
-                artifact["start_line"],
-                artifact["end_line"],
-                artifact["content_hash"],
-            )
-            artifact["payload"]["evidence_id"] = evidence_id
-            self.repository.add_artifact(
-                snapshot_id, artifact["canonical_key"], artifact["kind"],
-                artifact["content_hash"], evidence_id, artifact["payload"],
-            )
-            self.repository.add_node(
-                snapshot_id, "Behavior", artifact["kind"], source_revision,
-                f"bootstrap-{source_revision}", config_version, artifact["payload"],
-            )
-        active_snapshot_id = self.repository.get_active_snapshot_id()
-        if active_snapshot_id != expected_parent:
-            return self._reject(
-                snapshot_id, "PUBLISH_PARENT_MISMATCH",
-                {"expected_parent": expected_parent, "active_snapshot": active_snapshot_id},
-            )
-        SnapshotPublisher(self.repository).publish(snapshot_id)
-        self.repository.rebuild_node_index(snapshot_id)
+        try:
+            nodes = tuple(node for graph in graphs for node in graph.nodes)
+            edges = tuple(edge for graph in graphs for edge in graph.edges)
+            graph = GraphArtifact(nodes, edges, source_revision, f"bootstrap-{source_revision}")
+            persisted = self.repository.persist_graph_artifacts(snapshot_id, graph)
+        except ValidationError as error:
+            return self._reject(snapshot_id, error.code, {"message": str(error)})
+        try:
+            SnapshotPublisher(self.repository).publish(snapshot_id, expected_parent=expected_parent)
+        except ValidationError as error:
+            return self._reject(snapshot_id, error.code, {"expected_parent": expected_parent, "active_snapshot": self.repository.get_active_snapshot_id()})
         self.repository.complete_tasks(snapshot_id)
         return {
             "ok": True,
             "status": "published",
             "snapshot_id": snapshot_id,
             "manifest_id": manifest_id,
-            "node_count": len(artifacts),
+            "node_count": persisted["node_count"],
+            "edge_count": persisted["edge_count"],
         }
 
     def _reject(self, snapshot_id, code, detail):
