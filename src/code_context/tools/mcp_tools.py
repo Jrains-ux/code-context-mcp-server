@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 from code_context.bootstrap.first_build import BootstrapService
-from code_context.business import BusinessRouter
+from code_context.business import BusinessMiningService, BusinessRouter
 from code_context.consumer import DistributionService
 from code_context.consumer import EvaluationService
 from code_context.consumer import KnowledgeService
@@ -102,7 +102,7 @@ def health_result(connection, registry):
     }
 
 
-def run(command, database_path, manifest=None, source_root=None, scope=(), exclude=(), expected_parent=None, query=None, limit=20, node_ids=(), depth=1, node_budget=100, edge_budget=100, direction="out", edge_types=(), node_scope=None, operation_id=None, baseline_ref=None, target_source_revision=None, dataset_id=None, golden_set_version=None, samples=(), minimum_samples=1, tool_versions=None, document_kind=None, document_scope=None, template_version=None, generator_version=None, manifest_id=None, target=None, idempotency_key=None, mapping_id=None, expected_version=None, decision=None, evidence_refs=(), reason=None, review_mode=None, updated_by=None):
+def run(command, database_path, manifest=None, source_root=None, scope=(), exclude=(), expected_parent=None, query=None, limit=20, node_ids=(), depth=1, node_budget=100, edge_budget=100, direction="out", edge_types=(), node_scope=None, operation_id=None, baseline_ref=None, target_source_revision=None, dataset_id=None, golden_set_version=None, samples=(), minimum_samples=1, tool_versions=None, document_kind=None, document_scope=None, template_version=None, generator_version=None, manifest_id=None, target=None, idempotency_key=None, mapping_id=None, expected_version=None, decision=None, evidence_refs=(), reason=None, review_mode=None, updated_by=None, mining_mode=None, snapshot_id=None, candidates=(), query_text=None, ttl_seconds=300, route_token=None, context_id=None):
     db = Database(database_path)
     try:
         db.migrate()
@@ -167,6 +167,21 @@ def run(command, database_path, manifest=None, source_root=None, scope=(), exclu
                 )
             except ValidationError as error:
                 return {"ok": False, "code": error.code}
+        if command == "mine":
+            try:
+                return BusinessMiningService(db.connection).mine(mining_mode, snapshot_id, candidates)
+            except ValidationError as error:
+                return {"ok": False, "code": error.code}
+        if command == "resolve_business_context":
+            try:
+                return BusinessRouter(db.connection).resolve(query_text, ttl_seconds)
+            except ValidationError as error:
+                return {"ok": False, "code": error.code}
+        if command == "select_business_context":
+            try:
+                return BusinessRouter(db.connection).select(route_token, context_id)
+            except ValidationError as error:
+                return {"ok": False, "code": error.code}
         return {"ok": False, "code": "UNKNOWN_COMMAND", "command": command}
     finally:
         db.close()
@@ -174,7 +189,7 @@ def run(command, database_path, manifest=None, source_root=None, scope=(), exclu
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="code-context")
-    parser.add_argument("command", choices=("init", "migrate", "doctor", "health", "bootstrap", "search", "expand", "stdio", "sync", "evaluate", "knowledge-generate", "knowledge-push", "confirm"))
+    parser.add_argument("command", choices=("init", "migrate", "doctor", "health", "bootstrap", "search", "expand", "stdio", "sync", "evaluate", "knowledge-generate", "knowledge-push", "confirm", "mine", "resolve_business_context", "select_business_context"))
     parser.add_argument("--database", default=".code-context/context.db")
     parser.add_argument("--project", default="local")
     parser.add_argument("--workspace")
@@ -215,6 +230,13 @@ def main(argv=None):
     parser.add_argument("--reason")
     parser.add_argument("--review-mode")
     parser.add_argument("--updated-by")
+    parser.add_argument("--mining-mode")
+    parser.add_argument("--snapshot-id", type=int)
+    parser.add_argument("--candidates-json", default="[]")
+    parser.add_argument("--query-text")
+    parser.add_argument("--ttl-seconds", type=int, default=300)
+    parser.add_argument("--route-token")
+    parser.add_argument("--context-id")
     args = parser.parse_args(argv)
     if args.command == "stdio":
         from code_context.tools.stdio import StdioDispatcher
@@ -246,6 +268,9 @@ def main(argv=None):
         mapping_id=args.mapping_id, expected_version=args.expected_version,
         decision=args.decision, evidence_refs=json.loads(args.evidence_refs_json),
         reason=args.reason, review_mode=args.review_mode, updated_by=args.updated_by,
+        mining_mode=args.mining_mode, snapshot_id=args.snapshot_id,
+        candidates=json.loads(args.candidates_json), query_text=args.query_text,
+        ttl_seconds=args.ttl_seconds, route_token=args.route_token, context_id=args.context_id,
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0 if result.get("ok") else 1

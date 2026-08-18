@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from code_context.bootstrap.staging import SnapshotPublisher
-from code_context.business import BusinessRouter
+from code_context.business import BusinessMiningService, BusinessRouter
 from code_context.consumer import DistributionService
 from code_context.consumer import EvaluationService
 from code_context.consumer import KnowledgeService
@@ -458,6 +458,68 @@ class FoundationTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(json.loads(rows[0][0]), [first_evidence, second_evidence])
         self.assertEqual(rows[0][1:], ("manual_review_required", "reviewer"))
+
+    def test_mining_initial_persists_candidate_mapping_and_route(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "context.db")
+        self.addCleanup(db.close)
+        db.migrate()
+        repository = SnapshotRepository(db.connection)
+        snapshot_id = repository.create_snapshot("src", "idx", "1", "published")
+        repository.set_active_snapshot(snapshot_id)
+        evidence_id = repository.add_evidence("src", "idx", "1", "refund.py", 10, 12, "hash-1")
+
+        result = BusinessMiningService(db.connection).mine("initial", snapshot_id, [{
+            "biz_id": "orders.refund",
+            "term": "退款",
+            "context_id": "normal",
+            "summary": "普通退款",
+            "node_scope": {"canonical_keys": ["py:refund.request"]},
+            "node_type": "requirement",
+            "canonical_key": "requirement:orders.refund",
+            "payload": {"title": "退款申请"},
+            "evidence_refs": [evidence_id],
+            "review_mode": "manual_review_required",
+        }])
+
+        self.assertEqual(result["mode"], "initial")
+        self.assertEqual(result["candidate_count"], 1)
+        resolved = BusinessRouter(db.connection).resolve("退款")
+        self.assertEqual(resolved["status"], "selected")
+        self.assertEqual(resolved["candidates"][0]["context_id"], "normal")
+        mapping = db.connection.execute(
+            "SELECT status,review_mode FROM mappings WHERE biz_id=?", ("orders.refund",)
+        ).fetchone()
+        self.assertEqual(tuple(mapping), ("candidate", "manual_review_required"))
+
+    def test_cli_run_exposes_mining_and_business_context_tools(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        database_path = Path(tmp.name) / "context.db"
+        db = Database(database_path)
+        self.addCleanup(db.close)
+        db.migrate()
+        repository = SnapshotRepository(db.connection)
+        snapshot_id = repository.create_snapshot("src", "idx", "1", "published")
+        repository.set_active_snapshot(snapshot_id)
+        evidence_id = repository.add_evidence("src", "idx", "1", "refund.py", 1, 1, "hash")
+
+        mined = run("mine", database_path, mining_mode="initial", snapshot_id=snapshot_id, candidates=[{
+            "biz_id": "orders.refund", "term": "退款", "context_id": "normal",
+            "summary": "普通退款", "node_scope": {"canonical_keys": ["py:refund"]},
+            "node_type": "requirement", "canonical_key": "requirement:refund",
+            "payload": {"title": "退款"}, "evidence_refs": [evidence_id],
+        }])
+        resolved = run("resolve_business_context", database_path, query_text="退款")
+        selected = run(
+            "select_business_context", database_path,
+            route_token=resolved["route_token"], context_id="normal",
+        )
+
+        self.assertEqual(mined["status"], "candidate")
+        self.assertEqual(resolved["status"], "selected")
+        self.assertEqual(selected["node_scope"], {"canonical_keys": ["py:refund"]})
 
     def test_sync_rejects_missing_baseline_snapshot(self):
         tmp = tempfile.TemporaryDirectory()

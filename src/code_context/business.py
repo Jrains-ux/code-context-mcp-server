@@ -5,6 +5,65 @@ import uuid
 from code_context.validators.schema_validator import ValidationError
 
 
+class BusinessMiningService:
+    def __init__(self, connection): self.connection = connection
+
+    def mine(self, mode, snapshot_id, candidates):
+        if mode not in ("initial", "incremental"):
+            raise ValidationError("MINING_MODE_INVALID", "mode must be initial or incremental")
+        snapshot = self.connection.execute(
+            "SELECT * FROM snapshots WHERE snapshot_id=?", (snapshot_id,)
+        ).fetchone()
+        if snapshot is None:
+            raise ValidationError("SNAPSHOT_NOT_FOUND", "snapshot does not exist")
+        if not isinstance(candidates, list):
+            raise ValidationError("MINING_CANDIDATES_INVALID", "candidates must be a list")
+
+        run_id = uuid.uuid4().hex
+        try:
+            with self.connection:
+                for candidate in candidates:
+                    self._validate_candidate(candidate)
+                    evidence_refs = list(candidate["evidence_refs"])
+                    self.connection.execute(
+                        "INSERT INTO business_nodes(snapshot_id,node_type,canonical_key,payload_json,status,source_revision,index_revision,config_version) VALUES (?,?,?,?,?,?,?,?)",
+                        (snapshot_id, candidate["node_type"], candidate["canonical_key"], json.dumps(candidate["payload"], sort_keys=True), "candidate", snapshot["source_revision"], snapshot["index_revision"], snapshot["config_version"]),
+                    )
+                    mapping_cursor = self.connection.execute(
+                        "INSERT INTO mappings(biz_id,snapshot_id,status,evidence_id,requirement_id,anchor_node_ids_json,evidence_refs_json,review_required,review_mode,risk_level,confidence,review_batch_id,updated_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (candidate["biz_id"], snapshot_id, "candidate", evidence_refs[0], candidate.get("requirement_id"), json.dumps(candidate.get("anchor_node_ids", [])), json.dumps(evidence_refs), 1, candidate.get("review_mode", "manual_review_required"), candidate.get("risk_level"), candidate.get("confidence"), candidate.get("review_batch_id"), candidate.get("updated_by", "mining")),
+                    )
+                    mapping_id = mapping_cursor.lastrowid
+                    self.connection.executemany(
+                        "INSERT INTO mapping_evidence(mapping_id,evidence_id,created_by) VALUES (?,?,?)",
+                        [(mapping_id, evidence_id, candidate.get("updated_by", "mining")) for evidence_id in evidence_refs],
+                    )
+                    self.connection.execute(
+                        "INSERT OR REPLACE INTO business_routes(term,biz_id,context_id,summary,node_scope_json,snapshot_id) VALUES (?,?,?,?,?,?)",
+                        (candidate["term"], candidate["biz_id"], candidate["context_id"], candidate["summary"], json.dumps(candidate["node_scope"], sort_keys=True), snapshot_id),
+                    )
+                self.connection.execute(
+                    "INSERT INTO mining_runs(run_id,mode,snapshot_id,candidate_count,status) VALUES (?,?,?,?,?)",
+                    (run_id, mode, snapshot_id, len(candidates), "candidate"),
+                )
+        except Exception:
+            with self.connection:
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO mining_runs(run_id,mode,snapshot_id,candidate_count,status) VALUES (?,?,?,?,?)",
+                    (run_id, mode, snapshot_id, len(candidates), "rejected"),
+                )
+            raise
+        return {"ok": True, "run_id": run_id, "mode": mode, "snapshot_id": snapshot_id, "candidate_count": len(candidates), "status": "candidate"}
+
+    @staticmethod
+    def _validate_candidate(candidate):
+        required = ("biz_id", "term", "context_id", "summary", "node_scope", "node_type", "canonical_key", "payload", "evidence_refs")
+        if not isinstance(candidate, dict) or any(field not in candidate for field in required):
+            raise ValidationError("MINING_CANDIDATE_INVALID", "candidate is missing required fields")
+        if not candidate["evidence_refs"]:
+            raise ValidationError("EVIDENCE_REQUIRED", "candidate requires evidence")
+
+
 class BusinessRouter:
     def __init__(self, connection): self.connection = connection
 
