@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
@@ -17,6 +18,7 @@ from code_context.consumer import KnowledgeService
 from code_context.policies.permission import PermissionMatrix
 from code_context.storage.repository import SnapshotRepository
 from code_context.storage.schema import Database
+from code_context.sync import SyncService
 from code_context.tools.registry import ToolRegistry
 from code_context.tools.mcp_tools import main, run
 from code_context.validators.schema_validator import ValidationError
@@ -528,6 +530,61 @@ class FoundationTest(unittest.TestCase):
         run("init", database_path)
         result = run("sync", database_path)
         self.assertEqual(result["code"], "BASELINE_REF_NOT_FOUND")
+
+    def test_sync_parses_git_status_and_rename_changes(self):
+        changes = SyncService._parse_diff("M\tsrc/refund.py\nA\tsrc/new.py\nD\tsrc/old.py\nR100\tsrc/a.py\tsrc/b.py\n")
+        self.assertEqual(changes, [
+            {"status": "M", "path": "src/refund.py", "old_path": None},
+            {"status": "A", "path": "src/new.py", "old_path": None},
+            {"status": "D", "path": "src/old.py", "old_path": None},
+            {"status": "R", "path": "src/b.py", "old_path": "src/a.py"},
+        ])
+
+    def test_sync_stales_only_mappings_affected_by_git_diff_and_dependency_closure(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "context.db")
+        self.addCleanup(db.close)
+        db.migrate()
+        repository = SnapshotRepository(db.connection)
+        snapshot_id = repository.create_snapshot("base", "idx", "1", "published")
+        repository.set_active_snapshot(snapshot_id)
+        affected_node = repository.add_node(snapshot_id, "Graph", "function", "base", "idx", "1", {"name": "refund", "file_path": "src/refund.py"})
+        unaffected_node = repository.add_node(snapshot_id, "Graph", "function", "base", "idx", "1", {"name": "shipping", "file_path": "src/shipping.py"})
+        evidence = repository.add_evidence("base", "idx", "1", "src/refund.py", 1, 1, "hash")
+        affected_mapping = repository.add_mapping("orders.refund", snapshot_id, "confirmed", evidence, anchor_node_ids=[affected_node], evidence_refs=[evidence])
+        unaffected_mapping = repository.add_mapping("orders.shipping", snapshot_id, "confirmed", evidence, anchor_node_ids=[unaffected_node], evidence_refs=[evidence])
+
+        with patch("code_context.sync.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "M\tsrc/refund.py\n", "")), patch(
+            "code_context.sync.BootstrapService.build", return_value={"ok": True, "snapshot_id": 2, "status": "published"}
+        ):
+            result = SyncService(repository).update("op-1", snapshot_id, tmp.name, "target", "1", ["src"])
+
+        self.assertEqual(result["affected_node_ids"], [affected_node])
+        self.assertEqual(result["stale_mapping_ids"], [affected_mapping])
+        self.assertEqual(repository.get_mapping(affected_mapping)["status"], "stale")
+        self.assertEqual(repository.get_mapping(unaffected_mapping)["status"], "confirmed")
+
+    def test_sync_keeps_mapping_confirmed_when_rebuild_fails(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "context.db")
+        self.addCleanup(db.close)
+        db.migrate()
+        repository = SnapshotRepository(db.connection)
+        snapshot_id = repository.create_snapshot("base", "idx", "1", "published")
+        repository.set_active_snapshot(snapshot_id)
+        node_id = repository.add_node(snapshot_id, "Graph", "function", "base", "idx", "1", {"name": "refund", "file_path": "src/refund.py"})
+        evidence = repository.add_evidence("base", "idx", "1", "src/refund.py", 1, 1, "hash")
+        mapping_id = repository.add_mapping("orders.refund", snapshot_id, "confirmed", evidence, anchor_node_ids=[node_id], evidence_refs=[evidence])
+
+        with patch("code_context.sync.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "M\tsrc/refund.py\n", "")), patch(
+            "code_context.sync.BootstrapService.build", side_effect=ValidationError("BUILD_FAILED", "rebuild failed")
+        ):
+            with self.assertRaises(ValidationError):
+                SyncService(repository).update("op-fail", snapshot_id, tmp.name, "target", "1", ["src"])
+
+        self.assertEqual(repository.get_mapping(mapping_id)["status"], "confirmed")
 
     def test_doctor_reports_missing_registry_contract(self):
         tmp = tempfile.TemporaryDirectory()
