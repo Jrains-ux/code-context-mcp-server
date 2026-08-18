@@ -102,6 +102,27 @@ class BootstrapPhaseBTest(unittest.TestCase):
         self.assertIn('"resolution": "static"', caller_calls[0][2])
         self.assertIn('"bound": true', caller_calls[0][2])
 
+    def test_typescript_relative_import_does_not_bind_call_to_imported_class(self):
+        (self.source / "helper.ts").write_text("export class helper {}\n", encoding="utf-8")
+        (self.source / "caller.ts").write_text(
+            "import { helper } from './helper';\n"
+            "export function caller() { helper(); }\n",
+            encoding="utf-8",
+        )
+
+        result = self.service.build(self.source, "rev-ts-class-import", "cfg", ["."])
+
+        self.assertTrue(result["ok"])
+        row = self.db.connection.execute(
+            "SELECT json_extract(payload_json, '$.target_key'), payload_json "
+            "FROM edges WHERE snapshot_id=? AND edge_type='calls' "
+            "AND json_extract(payload_json, '$.source_key')=?",
+            (result["snapshot_id"], "function:caller@caller.ts.caller"),
+        ).fetchone()
+        self.assertEqual(row[0], "external:helper")
+        self.assertNotIn('"resolution": "static"', row[1])
+        self.assertNotIn('"bound": true', row[1])
+
     def test_typescript_relative_import_resolves_index_module(self):
         (self.source / "pkg").mkdir()
         (self.source / "pkg" / "index.ts").write_text("export function helper() {}\n", encoding="utf-8")

@@ -176,6 +176,15 @@ class BootstrapService:
             def is_visible(candidate):
                 candidate_module = candidate.payload.get("module_identity")
                 candidate_package = candidate.payload.get("package_identity")
+                relative_import = any(
+                    item.payload.get("language") in {"javascript", "typescript"}
+                    and (item.payload.get("import_source") or item.payload.get("source") or "").startswith(".")
+                    and item.payload.get("imported_symbol")
+                    and (item.payload.get("alias") or item.payload.get("imported_symbol")) == symbol
+                    for item in visible_imports
+                )
+                if relative_import and candidate.kind != "function":
+                    return False
                 same_context = source_package and candidate_package and source_package == candidate_package
                 imported = any(
                     self._javascript_import_matches(item, candidate, source, symbol)
@@ -199,6 +208,8 @@ class BootstrapService:
     @staticmethod
     def _javascript_import_matches(import_edge, candidate, source, symbol):
         if import_edge.payload.get("language") not in {"javascript", "typescript"}:
+            return False
+        if candidate.kind != "function":
             return False
         if candidate.payload.get("language") != import_edge.payload.get("language"):
             return False
