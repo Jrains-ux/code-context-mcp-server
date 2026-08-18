@@ -293,6 +293,10 @@ class SnapshotRepository:
         with self.connection:
             self.connection.execute("UPDATE task_runs SET status='completed' WHERE snapshot_id=?", (snapshot_id,))
 
+    def fail_tasks(self, snapshot_id):
+        with self.connection:
+            self.connection.execute("UPDATE task_runs SET status='failed' WHERE snapshot_id=?", (snapshot_id,))
+
     def add_artifact(self, snapshot_id, canonical_key, kind, content_hash, evidence_id, payload):
         with self.connection:
             self.connection.execute(

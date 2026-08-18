@@ -283,6 +283,7 @@ class BootstrapService:
 
     def _reject(self, snapshot_id, code, detail):
         self.repository.add_conflict(snapshot_id, code, detail)
+        self.repository.fail_tasks(snapshot_id)
         return {
             "ok": False, "status": "staging", "code": code, "snapshot_id": snapshot_id,
             "diagnostics": detail.get("diagnostics", []),

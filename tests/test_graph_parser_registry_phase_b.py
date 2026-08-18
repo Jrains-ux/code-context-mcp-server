@@ -143,6 +143,23 @@ class Hello extends Base implements Greeter {
         run_calls = [edge for edge in result.edges if edge.edge_type == "calls" and edge.source_key == run_key]
         self.assertEqual({edge.target_key for edge in run_calls}, {"external:helper"})
 
+    def test_javascript_nested_function_calls_stay_with_their_lexical_owner(self):
+        result = JavaScriptGraphParser().parse(
+            "demo.ts",
+            "function outer() {\n"
+            "    function inner() { innerCall(); }\n"
+            "    outerCall();\n"
+            "}\n",
+            source_revision="src", snapshot_revision="snap",
+        )
+
+        calls = {
+            node.name: {edge.target_key for edge in result.edges if edge.edge_type == "calls" and edge.source_key == node.canonical_key}
+            for node in result.nodes if node.kind == "function" and node.name in {"outer", "inner"}
+        }
+        self.assertEqual(calls["outer"], {"external:outerCall"})
+        self.assertEqual(calls["inner"], {"external:innerCall"})
+
     def test_dynamic_bracket_calls_are_not_reported_as_static(self):
         result = JavaScriptGraphParser().parse(
             "demo.js", "function run() { obj[method](); }",

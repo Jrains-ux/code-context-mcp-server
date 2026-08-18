@@ -64,6 +64,10 @@ class BootstrapPhaseBTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "PARSE_FAILED")
         self.assertEqual(self.repository.get_active_snapshot_id(), active)
+        statuses = self.db.connection.execute(
+            "SELECT DISTINCT status FROM task_runs WHERE snapshot_id=?", (result["snapshot_id"],)
+        ).fetchall()
+        self.assertEqual({row[0] for row in statuses}, {"failed"})
 
     def test_unique_same_language_cross_file_call_is_bound_without_fabricating_ambiguous_target(self):
         (self.source / "helper.py").write_text("def helper():\n    pass\n", encoding="utf-8")

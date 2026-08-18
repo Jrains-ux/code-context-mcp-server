@@ -745,6 +745,22 @@ class JavaScriptGraphParser(_HeuristicGraphParser):
                     }, line_number))
         return imports
 
+    def _calls(self, text):
+        return super()._calls(self._without_nested_declarations(text))
+
+    def _without_nested_declarations(self, text):
+        masked = list(text)
+        for pattern, kind in self._declaration_patterns:
+            if kind not in {"class", "interface", "function", "method"}:
+                continue
+            for match in pattern.finditer(text):
+                opening = text.find("{", match.end())
+                if opening < 0:
+                    continue
+                closing = self._matching_delimiter(text, opening)
+                masked[match.start():closing + 1] = " " * (closing + 1 - match.start())
+        return "".join(masked)
+
     def _root(self, path, lines):
         return "module", path.with_suffix("").as_posix().replace("/", ".")
 
