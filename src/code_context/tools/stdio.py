@@ -14,7 +14,25 @@ INTERNAL_ERROR = -32603
 class StdioDispatcher:
     """Line-oriented JSON-RPC dispatcher for the local command service."""
 
+    _MCP_PROTOCOL_VERSION = "2025-03-26"
+    _MCP_TOOLS = {
+        "init": "Initialize the local code context database.",
+        "migrate": "Apply database migrations.",
+        "doctor": "Check service readiness and tool permissions.",
+        "health": "Return service health information.",
+        "bootstrap": "Build and publish a code graph snapshot.",
+        "search": "Search published technical code nodes.",
+        "expand": "Expand graph relations and reconstruct paths.",
+        "sync": "Update a graph from a baseline snapshot.",
+        "evaluate": "Evaluate technical query results against a golden set.",
+        "knowledge-generate": "Generate a versioned knowledge artifact.",
+        "knowledge-push": "Push a knowledge artifact to a configured target.",
+    }
+
     _METHODS = {
+        "initialize": {"protocolVersion", "capabilities", "clientInfo"},
+        "tools/list": {"cursor"},
+        "tools/call": {"name", "arguments"},
         "search": {"query", "limit", "database"},
         "expand": {
             "node_ids", "depth", "node_budget", "edge_budget", "direction",
@@ -63,6 +81,18 @@ class StdioDispatcher:
         if not isinstance(params, dict) or not set(params) <= self._METHODS[method]:
             return self._error(request_id, INVALID_PARAMS, "Invalid params")
         try:
+            if method == "initialize":
+                return self._success(request_id, {
+                    "protocolVersion": self._MCP_PROTOCOL_VERSION,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "code-context", "version": "0.1.0"},
+                })
+            if method == "tools/list":
+                return self._success(request_id, {
+                    "tools": [self._tool_schema(name, description) for name, description in self._MCP_TOOLS.items()]
+                })
+            if method == "tools/call":
+                return self._handle_tool_call(request_id, params)
             kwargs = dict(params)
             database_path = kwargs.pop("database", self.default_database)
             self._validate_params(method, kwargs)
@@ -98,6 +128,34 @@ class StdioDispatcher:
         elif method == "bootstrap":
             if not isinstance(params.get("source_root"), str) or not params["source_root"]:
                 raise ValueError("source_root must be a non-empty string")
+
+    def _handle_tool_call(self, request_id, params):
+        name = params.get("name")
+        if name not in self._MCP_TOOLS:
+            return self._error(request_id, INVALID_PARAMS, "Unknown tool")
+        arguments = params.get("arguments", {})
+        if not isinstance(arguments, dict):
+            return self._error(request_id, INVALID_PARAMS, "arguments must be an object")
+        kwargs = dict(arguments)
+        database_path = kwargs.pop("database", self.default_database)
+        self._validate_params(name, kwargs)
+        result = self.runner(name, database_path, **kwargs)
+        return self._success(request_id, {
+            "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, sort_keys=True)}],
+            "isError": result.get("ok") is False if isinstance(result, dict) else False,
+        })
+
+    @staticmethod
+    def _tool_schema(name, description):
+        return {
+            "name": name,
+            "description": description,
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": True},
+        }
+
+    @staticmethod
+    def _success(request_id, result):
+        return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
     @staticmethod
     def _error(request_id, code, message):

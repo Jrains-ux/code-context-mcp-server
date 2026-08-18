@@ -12,6 +12,56 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class StdioDispatcherTests(unittest.TestCase):
+    def test_initialize_returns_mcp_protocol_and_capabilities(self):
+        from code_context.tools.stdio import StdioDispatcher
+
+        output = io.StringIO()
+        request = {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26", "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1"},
+            },
+        }
+        StdioDispatcher().serve(io.StringIO(json.dumps(request) + "\n"), output)
+
+        response = json.loads(output.getvalue())
+        self.assertEqual(response["result"]["protocolVersion"], "2025-03-26")
+        self.assertEqual(response["result"]["capabilities"]["tools"], {})
+        self.assertEqual(response["result"]["serverInfo"]["name"], "code-context")
+
+    def test_tools_list_returns_callable_tool_schemas(self):
+        from code_context.tools.stdio import StdioDispatcher
+
+        output = io.StringIO()
+        request = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+        StdioDispatcher().serve(io.StringIO(json.dumps(request) + "\n"), output)
+
+        response = json.loads(output.getvalue())
+        tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+        for name in ("search", "expand", "bootstrap", "sync", "evaluate", "knowledge-generate", "knowledge-push"):
+            self.assertIn(name, tools)
+            self.assertEqual(tools[name]["inputSchema"]["type"], "object")
+
+    def test_tools_call_dispatches_to_existing_runner(self):
+        from code_context.tools.stdio import StdioDispatcher
+
+        output = io.StringIO()
+        request = {
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "search",
+                "arguments": {"database": "test.db", "query": "Handler", "limit": 3},
+            },
+        }
+        with patch("code_context.tools.stdio.run", return_value={"ok": True, "nodes": []}) as runner:
+            StdioDispatcher().serve(io.StringIO(json.dumps(request) + "\n"), output)
+
+        response = json.loads(output.getvalue())
+        self.assertEqual(response["result"]["isError"], False)
+        self.assertEqual(json.loads(response["result"]["content"][0]["text"]), {"ok": True, "nodes": []})
+        runner.assert_called_once_with("search", "test.db", query="Handler", limit=3)
+
     def test_search_request_returns_correlated_result(self):
         from code_context.tools.stdio import StdioDispatcher
 
