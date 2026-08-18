@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import unittest
 
+import code_context
 from code_context.bootstrap import first_build
 
 
@@ -12,6 +13,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ProjectImportConfigTest(unittest.TestCase):
+    def test_test_runner_imports_top_level_package_from_src_layout(self) -> None:
+        module_path = Path(code_context.__file__).resolve()
+
+        self.assertEqual(
+            module_path,
+            PROJECT_ROOT / "src" / "code_context" / "__init__.py",
+        )
+
     def test_test_runner_imports_code_context_from_src_layout(self) -> None:
         module_path = Path(first_build.__file__).resolve()
 
