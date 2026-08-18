@@ -102,7 +102,7 @@ def health_result(connection, registry):
     }
 
 
-def run(command, database_path, manifest=None, source_root=None, scope=(), exclude=(), expected_parent=None, query=None, limit=20, node_ids=(), depth=1, node_budget=100, edge_budget=100, direction="out", edge_types=(), node_scope=None, operation_id=None, baseline_ref=None, target_source_revision=None, dataset_id=None, golden_set_version=None, samples=(), minimum_samples=1, tool_versions=None, document_kind=None, document_scope=None, template_version=None, generator_version=None, manifest_id=None, target=None, idempotency_key=None, mapping_id=None, expected_version=None, decision=None, evidence_refs=(), reason=None, review_mode=None, updated_by=None, mining_mode=None, snapshot_id=None, candidates=(), query_text=None, ttl_seconds=300, route_token=None, context_id=None):
+def run(command, database_path, manifest=None, source_root=None, scope=(), exclude=(), expected_parent=None, query=None, limit=20, node_ids=(), depth=1, node_budget=100, edge_budget=100, direction="out", edge_types=(), node_scope=None, operation_id=None, baseline_ref=None, target_source_revision=None, dataset_id=None, golden_set_version=None, samples=(), minimum_samples=1, tool_versions=None, mode="technical", document_kind=None, document_scope=None, template_version=None, generator_version=None, impact_node_ids=(), manifest_id=None, target=None, idempotency_key=None, mapping_id=None, expected_version=None, decision=None, evidence_refs=(), reason=None, review_mode=None, updated_by=None, mining_mode=None, snapshot_id=None, candidates=(), query_text=None, ttl_seconds=300, route_token=None, context_id=None):
     db = Database(database_path)
     try:
         db.migrate()
@@ -146,12 +146,12 @@ def run(command, database_path, manifest=None, source_root=None, scope=(), exclu
                 return {"ok": False, "code": error.code}
         if command == "evaluate":
             try:
-                return EvaluationService(db.connection).evaluate(dataset_id, golden_set_version, samples, tool_versions, minimum_samples)
+                return EvaluationService(db.connection).evaluate(dataset_id, golden_set_version, samples, tool_versions, minimum_samples, mode=mode)
             except ValidationError as error:
                 return {"ok": False, "code": error.code}
         if command == "knowledge-generate":
             try:
-                return KnowledgeService(db.connection).generate(document_kind, document_scope, template_version, generator_version)
+                return KnowledgeService(db.connection).generate(document_kind, document_scope, template_version, generator_version, impact_node_ids=impact_node_ids)
             except ValidationError as error:
                 return {"ok": False, "code": error.code}
         if command == "knowledge-push":

@@ -4,6 +4,7 @@ import time
 import uuid
 
 from code_context.query import TechnicalQueryService
+from code_context.business import BusinessRouter
 from code_context.validators.schema_validator import ValidationError
 
 
@@ -11,7 +12,7 @@ class EvaluationService:
     def __init__(self, connection):
         self.connection = connection
 
-    def evaluate(self, dataset_id, golden_set_version, samples, tool_versions=None, minimum_samples=1, snapshot_ref=None):
+    def evaluate(self, dataset_id, golden_set_version, samples, tool_versions=None, minimum_samples=1, snapshot_ref=None, mode="technical"):
         if len(samples) < minimum_samples:
             raise ValidationError("EVALUATION_INSUFFICIENT", "not enough evaluation samples")
         snapshot = _active_snapshot(self.connection, snapshot_ref)
@@ -19,10 +20,23 @@ class EvaluationService:
         failures = []
         passed = 0
         query = TechnicalQueryService(self.connection)
+        router = BusinessRouter(self.connection)
+        route_passed = 0
+        retrieved = relevant = 0
         for sample in samples:
-            result = query.search(sample["query"], sample.get("limit", 20))
-            actual = [node["node_id"] for node in result["nodes"]]
+            if mode == "business":
+                result = router.resolve(sample["query"])
+                actual = []
+                if result["status"] == sample.get("expected_status"):
+                    route_passed += 1
+                if result["status"] == "selected" and sample.get("context_id"):
+                    selected = router.select(result["route_token"], sample["context_id"])
+                    actual = [int(node_id) for node_id in selected["node_scope"]]
+            else:
+                result = query.search(sample["query"], sample.get("limit", 20))
+                actual = [node["node_id"] for node in result["nodes"]]
             expected = sample["expected_node_ids"]
+            relevant += len(set(expected)); retrieved += len(set(actual) & set(expected))
             if actual == expected:
                 passed += 1
             else:
@@ -36,6 +50,8 @@ class EvaluationService:
             "latency_ms": round((time.perf_counter() - started) * 1000, 3),
             "token_cost": 0,
         }
+        if mode == "business":
+            metrics.update({"route_accuracy": route_passed / len(samples), "precision": retrieved / sum(len(set(sample["expected_node_ids"])) or 1 for sample in samples), "recall": retrieved / relevant if relevant else 1.0})
         run_id = uuid.uuid4().hex
         with self.connection:
             self.connection.execute(
@@ -48,15 +64,25 @@ class EvaluationService:
             )
         return {"ok": True, "run_id": run_id, "metrics": metrics, "failure_cases": len(failures), "snapshot_ref": _snapshot_ref(snapshot)}
 
+    def acceptance_gate(self, metrics, thresholds):
+        failed = {key: {"actual": metrics.get(key), "required": value} for key, value in thresholds.items() if metrics.get(key, 0) < value}
+        if failed:
+            raise ValidationError("ACCEPTANCE_GATE_FAILED", json.dumps(failed, sort_keys=True))
+        return {"ok": True, "status": "passed"}
+
 
 class KnowledgeService:
     def __init__(self, connection):
         self.connection = connection
 
-    def generate(self, kind, document_scope, template_version, generator_version, snapshot_ref=None):
+    def generate(self, kind, document_scope, template_version, generator_version, snapshot_ref=None, impact_node_ids=None):
         snapshot = _active_snapshot(self.connection, snapshot_ref)
         if kind == "technical":
-            rows = self.connection.execute("SELECT node_id,kind,sub_kind,payload_json FROM nodes WHERE snapshot_id=? ORDER BY node_id", (snapshot["snapshot_id"],)).fetchall()
+            if impact_node_ids:
+                placeholders = ",".join("?" for _ in impact_node_ids)
+                rows = self.connection.execute(f"SELECT node_id,kind,sub_kind,payload_json FROM nodes WHERE snapshot_id=? AND node_id IN ({placeholders}) ORDER BY node_id", (snapshot["snapshot_id"], *impact_node_ids)).fetchall()
+            else:
+                rows = self.connection.execute("SELECT node_id,kind,sub_kind,payload_json FROM nodes WHERE snapshot_id=? ORDER BY node_id", (snapshot["snapshot_id"],)).fetchall()
             evidence_refs = sorted({json.loads(row[3]).get("evidence_id") for row in rows if json.loads(row[3]).get("evidence_id") is not None})
             body = [f"# Technical knowledge: {document_scope}", "", *[f"- {row[0]} {row[1]}/{row[2]} {json.loads(row[3]).get('name', '')}" for row in rows]]
         elif kind == "business":
@@ -84,14 +110,23 @@ class DistributionService:
     def __init__(self, connection):
         self.connection = connection
 
+    def configure_target(self, target, endpoint, options=None):
+        if not target or target == "local" or not endpoint.startswith("https://"):
+            raise ValidationError("DISTRIBUTION_TARGET_INVALID", "external targets require HTTPS")
+        with self.connection:
+            self.connection.execute("INSERT OR REPLACE INTO distribution_targets(target,endpoint,options_json,enabled) VALUES (?,?,?,1)", (target, endpoint, json.dumps(options or {}, sort_keys=True)))
+        return {"ok": True, "target": target}
+
     def push(self, manifest_id, target, idempotency_key):
         existing = self.connection.execute("SELECT result_json FROM distribution_attempts WHERE idempotency_key=?", (idempotency_key,)).fetchone()
         if existing is not None:
             return json.loads(existing[0])
         if self.connection.execute("SELECT 1 FROM document_manifests WHERE manifest_id=?", (manifest_id,)).fetchone() is None:
             raise ValidationError("DOCUMENT_MANIFEST_NOT_FOUND", "document manifest does not exist")
-        result = {"ok": target == "local", "manifest_id": manifest_id, "target": target, "status": "pushed" if target == "local" else "failed", "retryable": target != "local"}
-        if target != "local":
+        configured = self.connection.execute("SELECT 1 FROM distribution_targets WHERE target=? AND enabled=1", (target,)).fetchone()
+        supported = target == "local" or configured is not None
+        result = {"ok": supported, "manifest_id": manifest_id, "target": target, "status": "pushed" if supported else "failed", "retryable": not supported}
+        if not supported:
             result["code"] = "DISTRIBUTION_TARGET_UNSUPPORTED"
         with self.connection:
             self.connection.execute("INSERT INTO distribution_attempts(attempt_id,manifest_id,target,idempotency_key,status,retryable,result_json) VALUES (?,?,?,?,?,?,?)", (uuid.uuid4().hex, manifest_id, target, idempotency_key, result["status"], int(result["retryable"]), json.dumps(result, sort_keys=True)))

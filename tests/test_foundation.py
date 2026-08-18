@@ -707,6 +707,41 @@ class FoundationTest(unittest.TestCase):
         self.assertTrue(document["ok"])
         self.assertEqual(pushed["status"], "pushed")
 
+    def test_business_evaluation_reports_funnel_precision_recall_and_selection(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "context.db"); self.addCleanup(db.close); db.migrate()
+        repo = SnapshotRepository(db.connection)
+        sid = repo.create_snapshot("src", "idx", "1", "staging")
+        node = repo.add_node(sid, "Behavior", "fixture", "src", "idx", "1", {"name": "refund"})
+        SnapshotPublisher(repo).publish(sid); repo.rebuild_node_index(sid)
+        BusinessRouter(db.connection).add_candidate("refund", "biz.refund", "ctx", "refund", [node], sid)
+        result = EvaluationService(db.connection).evaluate("d", "g", [
+            {"query": "refund", "expected_status": "selected", "expected_node_ids": [node], "context_id": "ctx"}
+        ], mode="business")
+        self.assertEqual(result["metrics"]["route_accuracy"], 1.0)
+        self.assertEqual(result["metrics"]["recall"], 1.0)
+
+    def test_knowledge_supports_impact_scope_and_configured_distribution_target(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "context.db"); self.addCleanup(db.close); db.migrate()
+        repo = SnapshotRepository(db.connection); sid = repo.create_snapshot("src", "idx", "1", "staging")
+        first = repo.add_node(sid, "Behavior", "fixture", "src", "idx", "1", {"name": "keep"})
+        second = repo.add_node(sid, "Behavior", "fixture", "src", "idx", "1", {"name": "impact"})
+        SnapshotPublisher(repo).publish(sid)
+        doc = KnowledgeService(db.connection).generate("technical", "impact", "t", "g", impact_node_ids=[second])
+        content = db.connection.execute("SELECT content FROM document_artifacts WHERE artifact_id=?", (doc["artifact_id"],)).fetchone()[0]
+        self.assertIn("impact", content); self.assertNotIn("keep", content)
+        DistributionService(db.connection).configure_target("wiki", "https://wiki.example/api", {"token": "secret"})
+        pushed = DistributionService(db.connection).push(doc["manifest_id"], "wiki", "id-1")
+        self.assertEqual(pushed["status"], "pushed")
+
+    def test_acceptance_gate_fails_below_thresholds(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "context.db"); self.addCleanup(db.close); db.migrate()
+        with self.assertRaises(ValidationError) as error:
+            EvaluationService(db.connection).acceptance_gate({"accuracy": .8}, {"accuracy": .9})
+        self.assertEqual(error.exception.code, "ACCEPTANCE_GATE_FAILED")
+
 
 if __name__ == "__main__":
     unittest.main()
