@@ -132,6 +132,41 @@ class Hello extends Base implements Greeter {
         self.assertIn("external:Helper.execute", targets)
         self.assertIn("external:Worker", external)
 
+    def test_heuristic_calls_are_limited_to_the_current_function_body(self):
+        result = JavaGraphParser().parse(
+            "Demo.java",
+            "class Demo { void run() { helper(); } void other() { otherOnly(); } }",
+            source_revision="src", snapshot_revision="snap",
+        )
+
+        run_key = next(node.canonical_key for node in result.nodes if node.kind == "method" and node.name == "run")
+        run_calls = [edge for edge in result.edges if edge.edge_type == "calls" and edge.source_key == run_key]
+        self.assertEqual({edge.target_key for edge in run_calls}, {"external:helper"})
+
+    def test_dynamic_bracket_calls_are_not_reported_as_static(self):
+        result = JavaScriptGraphParser().parse(
+            "demo.js", "function run() { obj[method](); }",
+            source_revision="src", snapshot_revision="snap",
+        )
+
+        calls = [edge for edge in result.edges if edge.edge_type == "calls"]
+        self.assertTrue(calls)
+        self.assertTrue(all(edge.payload["resolution"] != "static" for edge in calls))
+        self.assertTrue(any(edge.payload["resolution"] in {"unresolved", "external"} for edge in calls))
+
+    def test_java_and_go_file_identities_prevent_same_package_key_collisions(self):
+        java_source = "package demo; class Shared {}"
+        go_source = "package demo\ntype Shared struct {}"
+        java_a = JavaGraphParser().parse("src/A.java", java_source, source_revision="src", snapshot_revision="snap")
+        java_b = JavaGraphParser().parse("src/B.java", java_source, source_revision="src", snapshot_revision="snap")
+        go_a = GoGraphParser().parse("src/a.go", go_source, source_revision="src", snapshot_revision="snap")
+        go_b = GoGraphParser().parse("src/b.go", go_source, source_revision="src", snapshot_revision="snap")
+
+        self.assertNotEqual(java_a.nodes[0].canonical_key, java_b.nodes[0].canonical_key)
+        self.assertNotEqual(go_a.nodes[0].canonical_key, go_b.nodes[0].canonical_key)
+        self.assertEqual(len({node.canonical_key for node in (*java_a.nodes, *java_b.nodes)}), len(java_a.nodes) + len(java_b.nodes))
+        self.assertEqual(len({node.canonical_key for node in (*go_a.nodes, *go_b.nodes)}), len(go_a.nodes) + len(go_b.nodes))
+
     def test_go_parser_extracts_basic_nodes_edges_and_metadata(self):
         source = """package main
 import \"fmt\"
@@ -148,6 +183,24 @@ func (u User) Run() { main() }
         self.assertTrue(all(node.payload["language"] == "go" for node in result.nodes))
         self.assertTrue(all(node.payload["extraction_method"] == "heuristic" for node in result.nodes))
 
+    def test_go_parser_extracts_grouped_imports(self):
+        result = GoGraphParser().parse(
+            "cmd/main.go",
+            'package main\nimport (\n    "fmt"\n    alias "net/http"\n)\nfunc main() {}\n',
+            source_revision="src", snapshot_revision="snap",
+        )
+
+        imports = [node for node in result.nodes if node.kind == "import"]
+        self.assertEqual({node.payload["import"] for node in imports}, {"fmt", "net/http"})
+
+    def test_java_parser_extracts_method_from_one_line_class_declaration(self):
+        result = JavaGraphParser().parse(
+            "Demo.java", "class Demo { void run() {} }",
+            source_revision="src", snapshot_revision="snap",
+        )
+
+        self.assertTrue(any(node.kind == "method" and node.name == "run" for node in result.nodes))
+
     def test_javascript_parser_extracts_js_and_typescript_basics(self):
         source = """import { helper } from './helper';
 export interface Service { run(): void }
@@ -163,6 +216,16 @@ export function start() { new App().run(); }
         self.assertTrue({"contains", "imports", "defines", "implements", "calls"} <= edge_types)
         self.assertTrue(all(node.payload["language"] == "typescript" for node in result.nodes))
         self.assertTrue(all(node.payload["extraction_method"] == "heuristic" for node in result.nodes))
+
+    def test_javascript_parser_keeps_language_local_to_each_path(self):
+        parser = JavaScriptGraphParser()
+        typescript = parser.parse("src/app.ts", "interface App {}", source_revision="src", snapshot_revision="snap")
+        self.assertEqual(parser.language, "javascript")
+        javascript = parser.parse("src/app.js", "class App {}", source_revision="src", snapshot_revision="snap")
+
+        self.assertEqual({node.payload["language"] for node in typescript.nodes}, {"typescript"})
+        self.assertEqual({node.payload["language"] for node in javascript.nodes}, {"javascript"})
+        self.assertEqual(parser.language, "javascript")
 
     def test_heuristic_parsers_degrade_empty_and_unbalanced_sources(self):
         for parser, path in ((JavaGraphParser(), "Empty.java"), (GoGraphParser(), "empty.go"), (JavaScriptGraphParser(), "empty.ts")):
