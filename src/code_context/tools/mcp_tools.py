@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from code_context.bootstrap.first_build import BootstrapService
+from code_context.business import BusinessRouter
 from code_context.consumer import DistributionService
 from code_context.consumer import EvaluationService
 from code_context.consumer import KnowledgeService
@@ -101,7 +102,7 @@ def health_result(connection, registry):
     }
 
 
-def run(command, database_path, manifest=None, source_root=None, scope=(), exclude=(), expected_parent=None, query=None, limit=20, node_ids=(), depth=1, node_budget=100, edge_budget=100, direction="out", edge_types=(), node_scope=None, operation_id=None, baseline_ref=None, target_source_revision=None, dataset_id=None, golden_set_version=None, samples=(), minimum_samples=1, tool_versions=None, document_kind=None, document_scope=None, template_version=None, generator_version=None, manifest_id=None, target=None, idempotency_key=None):
+def run(command, database_path, manifest=None, source_root=None, scope=(), exclude=(), expected_parent=None, query=None, limit=20, node_ids=(), depth=1, node_budget=100, edge_budget=100, direction="out", edge_types=(), node_scope=None, operation_id=None, baseline_ref=None, target_source_revision=None, dataset_id=None, golden_set_version=None, samples=(), minimum_samples=1, tool_versions=None, document_kind=None, document_scope=None, template_version=None, generator_version=None, manifest_id=None, target=None, idempotency_key=None, mapping_id=None, expected_version=None, decision=None, evidence_refs=(), reason=None, review_mode=None, updated_by=None):
     db = Database(database_path)
     try:
         db.migrate()
@@ -158,6 +159,14 @@ def run(command, database_path, manifest=None, source_root=None, scope=(), exclu
                 return DistributionService(db.connection).push(manifest_id, target, idempotency_key)
             except ValidationError as error:
                 return {"ok": False, "code": error.code}
+        if command == "confirm":
+            try:
+                return BusinessRouter(db.connection).confirm(
+                    mapping_id, expected_version, decision, evidence_refs, reason,
+                    review_mode=review_mode, updated_by=updated_by,
+                )
+            except ValidationError as error:
+                return {"ok": False, "code": error.code}
         return {"ok": False, "code": "UNKNOWN_COMMAND", "command": command}
     finally:
         db.close()
@@ -165,7 +174,7 @@ def run(command, database_path, manifest=None, source_root=None, scope=(), exclu
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="code-context")
-    parser.add_argument("command", choices=("init", "migrate", "doctor", "health", "bootstrap", "search", "expand", "stdio", "sync", "evaluate", "knowledge-generate", "knowledge-push"))
+    parser.add_argument("command", choices=("init", "migrate", "doctor", "health", "bootstrap", "search", "expand", "stdio", "sync", "evaluate", "knowledge-generate", "knowledge-push", "confirm"))
     parser.add_argument("--database", default=".code-context/context.db")
     parser.add_argument("--project", default="local")
     parser.add_argument("--workspace")
@@ -199,6 +208,13 @@ def main(argv=None):
     parser.add_argument("--manifest-id")
     parser.add_argument("--target")
     parser.add_argument("--idempotency-key")
+    parser.add_argument("--mapping-id", type=int)
+    parser.add_argument("--expected-version", type=int)
+    parser.add_argument("--decision")
+    parser.add_argument("--evidence-refs-json", default="[]")
+    parser.add_argument("--reason")
+    parser.add_argument("--review-mode")
+    parser.add_argument("--updated-by")
     args = parser.parse_args(argv)
     if args.command == "stdio":
         from code_context.tools.stdio import StdioDispatcher
@@ -227,6 +243,9 @@ def main(argv=None):
         document_scope=args.document_scope, template_version=args.template_version,
         generator_version=args.generator_version, manifest_id=args.manifest_id,
         target=args.target, idempotency_key=args.idempotency_key,
+        mapping_id=args.mapping_id, expected_version=args.expected_version,
+        decision=args.decision, evidence_refs=json.loads(args.evidence_refs_json),
+        reason=args.reason, review_mode=args.review_mode, updated_by=args.updated_by,
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0 if result.get("ok") else 1

@@ -396,6 +396,69 @@ class FoundationTest(unittest.TestCase):
         db.connection.commit()
         self.assertEqual(router.confirm(mapping_id, 1, "confirmed", [evidence_id], "review")["status"], "confirmed")
 
+    def test_business_mapping_preserves_anchor_evidence_and_review_metadata(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "context.db")
+        self.addCleanup(db.close)
+        db.migrate()
+        repository = SnapshotRepository(db.connection)
+        snapshot_id = repository.create_snapshot("src", "idx", "1", "published")
+        anchor_id = repository.add_business_node(
+            snapshot_id, "requirement", "refund.request", {"title": "退款申请"}, "candidate"
+        )
+        first_evidence = repository.add_evidence("src", "idx", "1", "refund.py", 10, 12, "hash-1")
+        second_evidence = repository.add_evidence("src", "idx", "1", "refund.py", 20, 24, "hash-2")
+
+        mapping_id = repository.add_mapping(
+            "orders.refund", snapshot_id, "candidate", first_evidence,
+            requirement_id="REQ-1", anchor_node_ids=[anchor_id],
+            evidence_refs=[first_evidence, second_evidence], review_required=True,
+            review_mode="manual_review_required", risk_level="high",
+            confidence=0.6, review_batch_id="batch-1", updated_by="miner",
+        )
+
+        mapping = repository.get_mapping(mapping_id)
+        self.assertEqual(mapping["requirement_id"], "REQ-1")
+        self.assertEqual(mapping["anchor_node_ids"], [anchor_id])
+        self.assertEqual(mapping["evidence_refs"], [first_evidence, second_evidence])
+        self.assertEqual(mapping["review_mode"], "manual_review_required")
+        self.assertEqual(mapping["risk_level"], "high")
+        self.assertEqual(mapping["confidence"], 0.6)
+        self.assertEqual(repository.get_mapping_evidence(mapping_id), [first_evidence, second_evidence])
+
+    def test_confirmation_audits_all_mapping_evidence_with_review_metadata(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "context.db")
+        self.addCleanup(db.close)
+        db.migrate()
+        repository = SnapshotRepository(db.connection)
+        snapshot_id = repository.create_snapshot("src", "idx", "1", "published")
+        repository.set_active_snapshot(snapshot_id)
+        first_evidence = repository.add_evidence("src", "idx", "1", "refund.py", 10, 12, "hash-1")
+        second_evidence = repository.add_evidence("src", "idx", "1", "refund.py", 20, 24, "hash-2")
+        mapping_id = repository.add_mapping(
+            "orders.refund", snapshot_id, "candidate", first_evidence,
+            evidence_refs=[first_evidence, second_evidence], review_mode="manual_review_required",
+        )
+        db.connection.execute("UPDATE mappings SET expected_version=1 WHERE mapping_id=?", (mapping_id,))
+        db.connection.commit()
+
+        result = BusinessRouter(db.connection).confirm(
+            mapping_id, 1, "confirmed", [first_evidence, second_evidence], "review",
+            review_mode="manual_review_required", updated_by="reviewer",
+        )
+
+        self.assertEqual(result["status"], "confirmed")
+        rows = db.connection.execute(
+            "SELECT evidence_refs_json,review_mode,updated_by FROM confirmation_audit WHERE mapping_id=?",
+            (mapping_id,),
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(json.loads(rows[0][0]), [first_evidence, second_evidence])
+        self.assertEqual(rows[0][1:], ("manual_review_required", "reviewer"))
+
     def test_sync_rejects_missing_baseline_snapshot(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
