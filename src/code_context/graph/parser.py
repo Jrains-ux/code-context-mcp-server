@@ -569,8 +569,9 @@ class _HeuristicGraphParser:
     @staticmethod
     def _body_after_declaration(lines, line_number, end):
         declaration_line = lines[line_number - 1].strip()
-        suffix = declaration_line[end:] + "\n" + "\n".join(lines[line_number:])
-        opening = suffix.find("{")
+        opening_consumed = end > 0 and declaration_line[end - 1] == "{"
+        suffix = declaration_line[end - 1 if opening_consumed else end:] + "\n" + "\n".join(lines[line_number:])
+        opening = 0 if opening_consumed else suffix.find("{")
         if opening < 0:
             return ""
         body = suffix[opening:]
