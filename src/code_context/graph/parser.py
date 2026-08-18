@@ -461,11 +461,13 @@ class _HeuristicGraphParser:
         imports.extend(self._imports_from_lines(import_lines))
 
         for imported, line_number in imports:
-            import_key = f"import:{root_identity}.{imported}"
+            import_payload = imported if isinstance(imported, dict) else {"import": imported}
+            import_name = import_payload.get("source") or import_payload.get("import") or ""
+            import_key = f"import:{root_identity}.{import_name}"
             if import_key in {node.canonical_key for node in nodes}:
                 continue
-            nodes.append(self._node("import", import_key, imported, line_number, file_path, evidence, snapshot_revision, quality, {"import": imported}))
-            edges.append(self._edge("imports", root_key, import_key, line_number, file_path, evidence, snapshot_revision, {"import": imported, "resolution": "external"}, quality))
+            nodes.append(self._node("import", import_key, import_name, line_number, file_path, evidence, snapshot_revision, quality, import_payload))
+            edges.append(self._edge("imports", root_key, import_key, line_number, file_path, evidence, snapshot_revision, import_payload | {"resolution": "external"}, quality))
 
         for kind, name, key, extra, line_number, start, end in declarations:
             for relation in ("extends", "implements"):
@@ -706,6 +708,42 @@ class JavaScriptGraphParser(_HeuristicGraphParser):
     def _imports(self, line):
         match = re.search(r"\bimport\s+(?:.+?\s+from\s+)?[\'\"]([^\'\"]+)[\'\"]", line)
         return (match.group(1),) if match else ()
+
+    def _imports_from_lines(self, lines):
+        imports = []
+        for line_number, line in enumerate(lines, 1):
+            match = re.search(r"\bimport\s+(.+?)\s+from\s+[\'\"]([^\'\"]+)[\'\"]", line)
+            if not match:
+                source_match = re.search(r"\bimport\s*[\'\"]([^\'\"]+)[\'\"]", line)
+                if source_match:
+                    imports.append(({"import": source_match.group(1), "source": source_match.group(1), "import_source": source_match.group(1)}, line_number))
+                continue
+            clause, source = match.groups()
+            named = re.search(r"\{([^}]*)\}", clause)
+            if named:
+                for item in named.group(1).split(","):
+                    parts = re.split(r"\s+as\s+", item.strip())
+                    imported = parts[0].strip()
+                    if imported:
+                        alias = parts[-1].strip()
+                        imports.append(({
+                            "import": source,
+                            "source": source,
+                            "import_source": source,
+                            "imported_symbol": imported,
+                            "alias": alias,
+                        }, line_number))
+            else:
+                default = clause.split(",", 1)[0].strip()
+                if default and re.fullmatch(r"[A-Za-z_$][\w$]*", default):
+                    imports.append(({
+                        "import": source,
+                        "source": source,
+                        "import_source": source,
+                        "imported_symbol": "default",
+                        "alias": default,
+                    }, line_number))
+        return imports
 
     def _root(self, path, lines):
         return "module", path.with_suffix("").as_posix().replace("/", ".")

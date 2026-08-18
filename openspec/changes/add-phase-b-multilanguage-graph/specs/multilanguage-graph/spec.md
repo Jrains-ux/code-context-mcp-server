@@ -69,6 +69,13 @@ Bootstrap MUST resolve a cross-file symbol only with the same language, module o
 - **WHEN** a caller imports a uniquely identified helper from another module
 - **THEN** Bootstrap MUST bind the relationship to that helper's qualified artifact key
 
+#### Scenario: JavaScript or TypeScript relative import
+
+- **WHEN** a JavaScript or TypeScript caller imports a named symbol from a relative module source
+- **THEN** Bootstrap MUST resolve the source against the caller file, trying the supported `.js`, `.jsx`, `.ts`, `.tsx` extensions and `index` files, and MUST bind only when the imported symbol identifies exactly one function artifact
+- **WHEN** the relative module or imported symbol is missing or ambiguous
+- **THEN** the call relationship MUST remain external or unresolved and MUST NOT be bound to an unrelated same-named symbol
+
 ### Requirement: Artifact-derived language coverage
 
 Bootstrap MUST derive language coverage and parser version records from each parsed artifact's payload or evidence metadata. `.ts` and `.tsx` artifacts MUST count as `typescript`; `.js` and `.jsx` artifacts MUST count as `javascript`. A mutable parser language field MUST NOT override artifact language identity.

@@ -79,6 +79,90 @@ class BootstrapPhaseBTest(unittest.TestCase):
         self.assertTrue(rows)
         self.assertTrue(any('"resolution": "static"' in row[0] for row in rows))
 
+    def test_javascript_relative_import_binds_call_to_imported_function_artifact(self):
+        (self.source / "helper.js").write_text("export function helper() {}\n", encoding="utf-8")
+        (self.source / "caller.js").write_text(
+            "import { helper } from './helper';\n"
+            "export function caller() { helper(); }\n",
+            encoding="utf-8",
+        )
+
+        result = self.service.build(self.source, "rev-js-import", "cfg", ["."])
+
+        self.assertTrue(result["ok"])
+        rows = self.db.connection.execute(
+            "SELECT json_extract(e.payload_json, '$.source_key'), "
+            "json_extract(e.payload_json, '$.target_key'), e.payload_json "
+            "FROM edges e WHERE e.snapshot_id=? AND e.edge_type='calls'",
+            (result["snapshot_id"],),
+        ).fetchall()
+        caller_calls = [row for row in rows if row[0] == "function:caller@caller.js.caller"]
+        self.assertEqual(len(caller_calls), 1)
+        self.assertEqual(caller_calls[0][1], "function:helper@helper.js.helper")
+        self.assertIn('"resolution": "static"', caller_calls[0][2])
+        self.assertIn('"bound": true', caller_calls[0][2])
+
+    def test_typescript_relative_import_resolves_index_module(self):
+        (self.source / "pkg").mkdir()
+        (self.source / "pkg" / "index.ts").write_text("export function helper() {}\n", encoding="utf-8")
+        (self.source / "caller.ts").write_text(
+            "import { helper } from './pkg';\n"
+            "export function caller() { helper(); }\n",
+            encoding="utf-8",
+        )
+
+        result = self.service.build(self.source, "rev-ts-index", "cfg", ["."])
+
+        self.assertTrue(result["ok"])
+        row = self.db.connection.execute(
+            "SELECT json_extract(payload_json, '$.target_key'), payload_json "
+            "FROM edges WHERE snapshot_id=? AND edge_type='calls' "
+            "AND json_extract(payload_json, '$.source_key')=?",
+            (result["snapshot_id"], "function:caller@caller.ts.caller"),
+        ).fetchone()
+        self.assertEqual(row[0], "function:pkg.index@pkg/index.ts.helper")
+        self.assertIn('"bound": true', row[1])
+
+    def test_typescript_relative_import_ambiguity_stays_external(self):
+        (self.source / "helper.ts").write_text("export function helper() {}\n", encoding="utf-8")
+        (self.source / "helper.tsx").write_text("export function helper() {}\n", encoding="utf-8")
+        (self.source / "caller.ts").write_text(
+            "import { helper } from './helper';\n"
+            "export function caller() { helper(); }\n",
+            encoding="utf-8",
+        )
+
+        result = self.service.build(self.source, "rev-ts-ambiguous", "cfg", ["."])
+
+        self.assertTrue(result["ok"])
+        row = self.db.connection.execute(
+            "SELECT json_extract(payload_json, '$.target_key'), payload_json "
+            "FROM edges WHERE snapshot_id=? AND edge_type='calls' "
+            "AND json_extract(payload_json, '$.source_key')=?",
+            (result["snapshot_id"], "function:caller@caller.ts.caller"),
+        ).fetchone()
+        self.assertEqual(row[0], "external:helper")
+        self.assertNotIn('"bound": true', row[1])
+
+    def test_javascript_relative_import_without_matching_module_stays_external(self):
+        (self.source / "caller.js").write_text(
+            "import { helper } from './missing';\n"
+            "export function caller() { helper(); }\n",
+            encoding="utf-8",
+        )
+
+        result = self.service.build(self.source, "rev-js-missing", "cfg", ["."])
+
+        self.assertTrue(result["ok"])
+        row = self.db.connection.execute(
+            "SELECT json_extract(payload_json, '$.target_key'), payload_json "
+            "FROM edges WHERE snapshot_id=? AND edge_type='calls' "
+            "AND json_extract(payload_json, '$.source_key')=?",
+            (result["snapshot_id"], "function:caller@caller.js.caller"),
+        ).fetchone()
+        self.assertEqual(row[0], "external:helper")
+        self.assertNotIn('"bound": true', row[1])
+
     def test_same_named_helpers_in_different_packages_require_import_context(self):
         for package in ("one", "two"):
             (self.source / package).mkdir()

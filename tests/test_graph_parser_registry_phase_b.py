@@ -217,6 +217,19 @@ export function start() { new App().run(); }
         self.assertTrue(all(node.payload["language"] == "typescript" for node in result.nodes))
         self.assertTrue(all(node.payload["extraction_method"] == "heuristic" for node in result.nodes))
 
+    def test_javascript_import_payload_preserves_relative_source_and_imported_symbol(self):
+        result = JavaScriptGraphParser().parse(
+            "src/caller.ts",
+            "import { helper as importedHelper } from './helper';\n",
+            source_revision="src", snapshot_revision="snap",
+        )
+
+        imports = [edge for edge in result.edges if edge.edge_type == "imports"]
+        self.assertEqual(len(imports), 1)
+        self.assertEqual(imports[0].payload["import_source"], "./helper")
+        self.assertEqual(imports[0].payload["imported_symbol"], "helper")
+        self.assertEqual(imports[0].payload["alias"], "importedHelper")
+
     def test_javascript_parser_keeps_language_local_to_each_path(self):
         parser = JavaScriptGraphParser()
         typescript = parser.parse("src/app.ts", "interface App {}", source_revision="src", snapshot_revision="snap")

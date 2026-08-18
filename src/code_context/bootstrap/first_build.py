@@ -1,6 +1,7 @@
 import ast
 from dataclasses import replace
 import json
+import posixpath
 from pathlib import Path
 
 from code_context.bootstrap.staging import SnapshotPublisher
@@ -177,7 +178,8 @@ class BootstrapService:
                 candidate_package = candidate.payload.get("package_identity")
                 same_context = source_package and candidate_package and source_package == candidate_package
                 imported = any(
-                    item.payload.get("module") == candidate_module
+                    self._javascript_import_matches(item, candidate, source, symbol)
+                    or item.payload.get("module") == candidate_module
                     or item.payload.get("import") == candidate_module
                     or item.payload.get("target_key", "").endswith(candidate_module or "")
                     or self._import_names_candidate(item, candidate)
@@ -193,6 +195,32 @@ class BootstrapService:
             else:
                 bound.append(edge)
         return tuple(bound)
+
+    @staticmethod
+    def _javascript_import_matches(import_edge, candidate, source, symbol):
+        if import_edge.payload.get("language") not in {"javascript", "typescript"}:
+            return False
+        if candidate.payload.get("language") != import_edge.payload.get("language"):
+            return False
+        import_source = import_edge.payload.get("import_source") or import_edge.payload.get("source")
+        imported_symbol = import_edge.payload.get("imported_symbol")
+        alias = import_edge.payload.get("alias") or imported_symbol
+        if not import_source or not imported_symbol or alias != symbol:
+            return False
+        if not import_source.startswith("."):
+            return False
+        source_path = Path(source.location.path).as_posix()
+        candidate_path = Path(candidate.location.path).as_posix()
+        base = posixpath.dirname(source_path)
+        requested = posixpath.normpath(posixpath.join(base, import_source))
+        suffix = posixpath.splitext(requested)[1].lower()
+        candidates = {requested} if suffix in {".js", ".jsx", ".ts", ".tsx"} else {
+            requested + extension for extension in (".js", ".jsx", ".ts", ".tsx")
+        } | {
+            posixpath.join(requested, "index" + extension)
+            for extension in (".js", ".jsx", ".ts", ".tsx")
+        }
+        return candidate_path in candidates and candidate.payload.get("name") == imported_symbol
 
     @staticmethod
     def _import_names_candidate(import_edge, candidate):
