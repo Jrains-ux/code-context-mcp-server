@@ -8,6 +8,80 @@ from typing import Any, Protocol, Sequence, runtime_checkable
 from .artifacts import EdgeArtifact, GraphArtifact, GraphDiagnostic, NodeArtifact, SourceEvidence, SourceLocation
 
 
+def _mask_source(source: str, *, remove_strings: bool) -> str:
+    """Mask comments and optionally string contents while preserving line/column offsets."""
+    chars = list(source)
+    i = 0
+    state = "code"
+    quote = ""
+    while i < len(source):
+        current = source[i]
+        following = source[i + 1] if i + 1 < len(source) else ""
+        if state == "code":
+            if current == "/" and following == "/":
+                chars[i] = chars[i + 1] = " "
+                i += 2
+                state = "line_comment"
+                continue
+            if current == "/" and following == "*":
+                chars[i] = chars[i + 1] = " "
+                i += 2
+                state = "block_comment"
+                continue
+            if current == "#":
+                chars[i] = " "
+                i += 1
+                state = "line_comment"
+                continue
+            if current in {"'", '"', "`"}:
+                quote = current
+                state = "string"
+                if remove_strings:
+                    chars[i] = " "
+                i += 1
+                continue
+            i += 1
+            continue
+        if state == "line_comment":
+            if current == "\n":
+                state = "code"
+            else:
+                chars[i] = " "
+            i += 1
+            continue
+        if state == "block_comment":
+            if current == "*" and following == "/":
+                chars[i] = chars[i + 1] = " "
+                i += 2
+                state = "code"
+            else:
+                if current != "\n":
+                    chars[i] = " "
+                i += 1
+            continue
+        if state == "string":
+            if current == "\\":
+                if remove_strings and current != "\n":
+                    chars[i] = " "
+                if i + 1 < len(source):
+                    if remove_strings and source[i + 1] != "\n":
+                        chars[i + 1] = " "
+                    i += 2
+                else:
+                    i += 1
+                continue
+            if current == quote:
+                if remove_strings:
+                    chars[i] = " "
+                i += 1
+                state = "code"
+                continue
+            if remove_strings and current != "\n":
+                chars[i] = " "
+            i += 1
+    return "".join(chars)
+
+
 @runtime_checkable
 class GraphParser(Protocol):
     parser_id: str
@@ -33,6 +107,13 @@ class ParserRegistry:
         self._parsers: dict[str, GraphParser] = {}
         for parser in parsers:
             self.register(parser)
+
+    @classmethod
+    def default(cls):
+        return cls((PythonGraphParser(), JavaGraphParser(), GoGraphParser(), JavaScriptGraphParser()))
+
+    def summary(self):
+        return {parser.language: f"{parser.parser_id}-{parser.version}" for parser in self._parsers.values()}
 
     def register(self, parser: GraphParser) -> None:
         normalized = [self._normalize_suffix(extension) for extension in parser.supported_extensions]
@@ -83,6 +164,14 @@ class ParserRegistry:
                     str(path),
                     str(error),
                     {"line": error.lineno, "column": error.offset},
+                ),),
+            )
+        except Exception as error:
+            return GraphArtifact(
+                (), (), source_revision, snapshot_revision,
+                (GraphDiagnostic(
+                    "PARSER_ERROR", str(path), str(error),
+                    {"parser_id": parser.parser_id, "language": parser.language},
                 ),),
             )
 
@@ -323,8 +412,11 @@ class _HeuristicGraphParser:
         if not source.strip():
             return GraphArtifact((), (), source_revision, snapshot_revision)
 
-        lines = source.splitlines()
-        quality = "complete" if self._balanced(source) else "partial"
+        declaration_source = self._mask_comments_and_strings(source)
+        import_source = self._mask_comments(source)
+        lines = declaration_source.splitlines()
+        import_lines = import_source.splitlines()
+        quality = "complete" if self._balanced(declaration_source) else "partial"
         root_kind, root_name = self._root(file_path, lines)
         root_identity = self._root_identity(file_path, root_name)
         root_key = f"{root_kind}:{root_identity}"
@@ -334,18 +426,29 @@ class _HeuristicGraphParser:
         declarations = []
         imports = []
 
+        class_ranges = self._class_ranges(declaration_source)
+        used_keys = {root_key}
         for line_number, line in enumerate(lines, 1):
             stripped = line.strip()
             if not stripped or stripped.startswith(("//", "#", "/*", "*")):
                 continue
             for kind, name, extra, start, end in self._declarations(stripped):
-                key = f"{kind}:{root_identity}.{name}"
-                if key not in {node.canonical_key for node in nodes}:
-                    nodes.append(self._node(kind, key, name, line_number, file_path, evidence, snapshot_revision, quality, extra))
-                    edges.append(self._edge("contains", root_key, key, line_number, file_path, evidence, snapshot_revision, quality=quality))
-                symbols[name] = key
+                absolute_start = sum(len(item) + 1 for item in lines[:line_number - 1]) + start
+                scope = self._enclosing_scope(class_ranges, absolute_start)
+                if kind == "method" and language in {"javascript", "typescript"} and scope is None:
+                    continue
+                qualified = f"{root_identity}.{scope + '.' if scope else ''}{name}"
+                key = f"{kind}:{qualified}"
+                if key in used_keys:
+                    key = f"{key}@{line_number}:{start}"
+                    qualified = f"{qualified}@{line_number}:{start}"
+                used_keys.add(key)
+                nodes.append(self._node(kind, key, name, line_number, file_path, evidence, snapshot_revision, quality, {**extra, "qualified_name": qualified}))
+                owner = root_key if scope is None else self._scope_key(root_identity, scope, nodes)
+                edges.append(self._edge("contains", owner, key, line_number, file_path, evidence, snapshot_revision, quality=quality))
+                symbols.setdefault(name, key)
                 declarations.append((kind, name, key, extra, line_number, start, end))
-        imports.extend(self._imports_from_lines(lines))
+        imports.extend(self._imports_from_lines(import_lines))
 
         for imported, line_number in imports:
             import_key = f"import:{root_identity}.{imported}"
@@ -394,6 +497,50 @@ class _HeuristicGraphParser:
                         extra[relation] = tuple(item.strip() for item in value.split(",") if item.strip())
                 result.append((kind, name, extra, match.start(), match.end()))
         return sorted(result, key=lambda item: (item[3], item[4]))
+
+    @staticmethod
+    def _mask_comments_and_strings(source):
+        return _mask_source(source, remove_strings=True)
+
+    @staticmethod
+    def _mask_comments(source):
+        return _mask_source(source, remove_strings=False)
+
+    def _class_ranges(self, source):
+        ranges = []
+        for pattern, kind in self._declaration_patterns:
+            if kind not in {"class", "interface", "struct"}:
+                continue
+            for match in pattern.finditer(source):
+                opening = source.find("{", match.end())
+                if opening >= 0:
+                    ranges.append((opening, self._matching_delimiter(source, opening), match.group("name")))
+        return sorted(ranges, key=lambda item: item[0])
+
+    @staticmethod
+    def _matching_delimiter(source, opening):
+        depth = 0
+        for index in range(opening, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    return index
+        return len(source)
+
+    @staticmethod
+    def _enclosing_scope(ranges, position):
+        candidates = [item for item in ranges if item[0] < position <= item[1]]
+        return candidates[-1][2] if candidates else None
+
+    @staticmethod
+    def _scope_key(root_identity, scope, nodes):
+        return next(
+            (node.canonical_key for node in reversed(nodes)
+             if node.name == scope and node.kind in {"class", "interface", "struct"}),
+            f"class:{root_identity}.{scope}",
+        )
 
     @staticmethod
     def _balanced(source):
@@ -552,3 +699,6 @@ class JavaScriptGraphParser(_HeuristicGraphParser):
 
     def _root(self, path, lines):
         return "module", path.with_suffix("").as_posix().replace("/", ".")
+
+    def _root_identity(self, path, root_name):
+        return f"{root_name}@{path.as_posix()}"

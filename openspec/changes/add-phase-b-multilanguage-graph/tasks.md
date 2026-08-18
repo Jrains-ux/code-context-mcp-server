@@ -21,13 +21,12 @@
 
 ## 4. TDD：Bootstrap 集成和跨文件绑定
 
-- [ ] 4.1 RED/GREEN：按 registry 扫描多语言文件，manifest 记录 parser coverage。
-- [ ] 4.2 RED/GREEN：同语言跨文件唯一符号绑定和 external fallback。
-- [ ] 4.3 RED/GREEN：混合语言 snapshot 原子发布，失败保持 active snapshot 不变。
+- [x] 4.1 RED/GREEN：按 registry 扫描多语言文件，manifest 记录 parser coverage。
+- [x] 4.2 RED/GREEN：同语言跨文件唯一符号绑定和 external fallback。
+- [x] 4.3 RED/GREEN：混合语言 snapshot 原子发布，失败保持 active snapshot 不变。
 
 ## 5. 审查与验证
 
 - [ ] 5.1 规格审查：逐项核对 design 与 OpenSpec。
 - [ ] 5.2 代码质量审查：边界、错误处理、兼容性和测试质量。
 - [ ] 5.3 全量测试、compile、diff check 和 OpenSpec strict validation。
-

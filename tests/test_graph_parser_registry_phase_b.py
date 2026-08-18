@@ -258,6 +258,61 @@ export function start() { new App().run(); }
         for artifact in (*result.nodes, *result.edges):
             self.assertTrue(required <= set(artifact.payload))
 
+    def test_heuristic_scanners_ignore_declarations_and_delimiters_in_comments_and_strings(self):
+        source = '''
+// class Fake { void fake() {} }
+const text = "function fake() { class Nope {}";
+class Real { void run() {} }
+'''
+        result = JavaScriptGraphParser().parse("demo.js", source, source_revision="src", snapshot_revision="snap")
+        declarations = {(node.kind, node.name) for node in result.nodes}
+        self.assertIn(("class", "Real"), declarations)
+        self.assertIn(("method", "run"), declarations)
+        self.assertNotIn(("class", "Fake"), declarations)
+        self.assertNotIn(("function", "fake"), declarations)
+        self.assertNotIn(("class", "Nope"), declarations)
+        self.assertEqual(result.nodes[0].payload["parse_quality"], "complete")
+
+    def test_javascript_top_level_function_is_not_reclassified_as_method(self):
+        result = JavaScriptGraphParser().parse(
+            "demo.js", "function start() { return 1; }\nconst arrow = () => start();\n",
+            source_revision="src", snapshot_revision="snap",
+        )
+        self.assertEqual([node.kind for node in result.nodes if node.name == "start"], ["function"])
+
+    def test_heuristic_canonical_keys_distinguish_scopes_and_duplicate_declarations(self):
+        result = JavaGraphParser().parse(
+            "Demo.java", "class Outer { class Inner {} class Inner {} }\nclass Other { class Inner {} }\n",
+            source_revision="src", snapshot_revision="snap",
+        )
+        keys = [node.canonical_key for node in result.nodes]
+        self.assertEqual(len(keys), len(set(keys)))
+        inners = [node for node in result.nodes if node.name == "Inner"]
+        self.assertEqual(len(inners), 3)
+        self.assertEqual(len({node.payload["qualified_name"] for node in inners}), 3)
+
+    def test_registry_converts_non_syntax_parser_errors_to_diagnostic(self):
+        class BrokenParser(_ParserStub):
+            def parse(self, path, source, *, source_revision, snapshot_revision, config_revision=""):
+                raise RuntimeError("parser exploded")
+
+        result = ParserRegistry([BrokenParser("broken", {".broken"})]).parse(
+            "broken.broken", "x", source_revision="src", snapshot_revision="snap"
+        )
+        self.assertEqual(result.nodes, ())
+        self.assertEqual(result.edges, ())
+        self.assertEqual(result.diagnostics[0].code, "PARSER_ERROR")
+
+    def test_default_registry_contains_all_phase_b_languages_and_summary(self):
+        registry = ParserRegistry.default()
+        self.assertEqual(registry.detect("a.py").language, "python")
+        self.assertEqual(registry.detect("a.java").language, "java")
+        self.assertEqual(registry.detect("a.go").language, "go")
+        self.assertEqual(registry.detect("a.ts").language, "javascript")
+        summary = registry.summary()
+        self.assertEqual(summary["python"], "python-ast-1")
+        self.assertIn("java-heuristic-1", summary.values())
+
 
 if __name__ == "__main__":
     unittest.main()
