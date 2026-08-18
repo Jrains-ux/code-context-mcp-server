@@ -32,4 +32,3 @@ Bootstrap 先解析全部支持文件，再执行 parser 输出的 local symbol 
 - 单个文件语法错误记录 diagnostics 并使本次 snapshot fail-closed；不发布半成品。
 - 不支持的后缀不视为解析成功，coverage 报告必须列出。
 - 已有 Phase A 的 revisions、evidence、CAS 和发布隔离行为保持不变。
-

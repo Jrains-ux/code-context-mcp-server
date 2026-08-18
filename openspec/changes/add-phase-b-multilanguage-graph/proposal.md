@@ -18,4 +18,3 @@ Phase A 已建立 Python AST 技术图谱、快照发布、路径遍历和 stdio
 - 本阶段不实现需求/工单/赔付规则 mapping、Mining、BusinessRouter 闭环。
 - 本阶段不实现 Git diff 增量、向量检索和真实项目规模性能门禁。
 - 不使用网络下载或第三方 parser 依赖；复杂语法采用可解释降级，并在 evidence/diagnostics 中标记。
-

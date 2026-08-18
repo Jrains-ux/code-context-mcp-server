@@ -299,6 +299,8 @@ class PythonGraphParser:
             {
                 "name": name,
                 "qualified_name": qualified_name,
+                "module_identity": qualified_name.rsplit(".", 1)[0] if "." in qualified_name else qualified_name,
+                "package_identity": qualified_name.rsplit(".", 2)[0] if qualified_name.count(".") >= 2 else "",
                 "language": "python",
                 "extraction_method": "ast",
                 "evidence_level": "observed",
@@ -420,7 +422,11 @@ class _HeuristicGraphParser:
         root_kind, root_name = self._root(file_path, lines)
         root_identity = self._root_identity(file_path, root_name)
         root_key = f"{root_kind}:{root_identity}"
-        nodes = [self._node(root_kind, root_key, root_name, 1, file_path, evidence, snapshot_revision, quality)]
+        package_identity = root_name if root_kind == "package" else root_name.rsplit(".", 1)[0] if "." in root_name else ""
+        nodes = [self._node(root_kind, root_key, root_name, 1, file_path, evidence, snapshot_revision, quality, {
+            "module_identity": root_identity,
+            "package_identity": package_identity,
+        })]
         edges = []
         symbols = {}
         declarations = []
@@ -443,7 +449,11 @@ class _HeuristicGraphParser:
                     key = f"{key}@{line_number}:{start}"
                     qualified = f"{qualified}@{line_number}:{start}"
                 used_keys.add(key)
-                nodes.append(self._node(kind, key, name, line_number, file_path, evidence, snapshot_revision, quality, {**extra, "qualified_name": qualified}))
+                nodes.append(self._node(kind, key, name, line_number, file_path, evidence, snapshot_revision, quality, {
+                    **extra, "qualified_name": qualified,
+                    "module_identity": root_identity,
+                    "package_identity": package_identity,
+                }))
                 owner = root_key if scope is None else self._scope_key(root_identity, scope, nodes)
                 edges.append(self._edge("contains", owner, key, line_number, file_path, evidence, snapshot_revision, quality=quality))
                 symbols.setdefault(name, key)
