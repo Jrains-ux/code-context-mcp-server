@@ -2,13 +2,93 @@
 
 import ast
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, Sequence, runtime_checkable
 
 from .artifacts import EdgeArtifact, GraphArtifact, NodeArtifact, SourceEvidence, SourceLocation
 
 
+@runtime_checkable
+class GraphParser(Protocol):
+    parser_id: str
+    version: str
+    language: str
+    supported_extensions: frozenset[str]
+
+    def parse(
+        self,
+        path: str | Path,
+        source: str,
+        *,
+        source_revision: str,
+        snapshot_revision: str,
+        config_revision: str = "",
+    ) -> GraphArtifact: ...
+
+
+class ParserRegistry:
+    """Deterministically select a parser by its longest supported suffix."""
+
+    def __init__(self, parsers: Sequence[GraphParser] = ()):
+        self._parsers: dict[str, GraphParser] = {}
+        for parser in parsers:
+            self.register(parser)
+
+    def register(self, parser: GraphParser) -> None:
+        for extension in parser.supported_extensions:
+            suffix = self._normalize_suffix(extension)
+            if suffix in self._parsers:
+                raise ValueError(f"parser suffix already registered: {suffix}")
+            self._parsers[suffix] = parser
+
+    def detect(self, path: str | Path) -> GraphParser | None:
+        name = Path(path).name.lower()
+        matches = [suffix for suffix in self._parsers if name.endswith(suffix)]
+        if not matches:
+            return None
+        return self._parsers[max(matches, key=len)]
+
+    def parse(
+        self,
+        path: str | Path,
+        source: str,
+        *,
+        source_revision: str,
+        snapshot_revision: str,
+        config_revision: str = "",
+    ) -> GraphArtifact:
+        from .artifacts import GraphDiagnostic
+
+        parser = self.detect(path)
+        if parser is None:
+            return GraphArtifact(
+                (), (), source_revision, snapshot_revision,
+                (GraphDiagnostic(
+                    "UNSUPPORTED_FILE_SUFFIX",
+                    str(path),
+                    f"no parser registered for file suffix: {Path(path).suffix or '<none>'}",
+                    {"suffix": Path(path).suffix.lower()},
+                ),),
+            )
+        return parser.parse(
+            path, source,
+            source_revision=source_revision,
+            snapshot_revision=snapshot_revision,
+            config_revision=config_revision,
+        )
+
+    @staticmethod
+    def _normalize_suffix(suffix: str) -> str:
+        suffix = suffix.lower()
+        return suffix if suffix.startswith(".") else f".{suffix}"
+
+
 class PythonGraphParser:
     """Parse one Python source file without attempting dynamic dispatch resolution."""
+
+    parser_id = "python-ast"
+    version = "1"
+    language = "python"
+    supported_extensions = frozenset({".py"})
 
     def parse(
         self,
@@ -113,12 +193,29 @@ class PythonGraphParser:
             PythonGraphParser._location(node, path),
             evidence,
             snapshot,
-            {"name": name, "qualified_name": qualified_name},
+            {
+                "name": name,
+                "qualified_name": qualified_name,
+                "language": "python",
+                "extraction_method": "ast",
+                "evidence_level": "observed",
+                "parse_quality": "complete",
+            },
         )
 
     @staticmethod
     def _edge(edge_type: str, source: str, target: str, node: ast.AST, path: Path, evidence: SourceEvidence, snapshot: str, payload: dict[str, Any] | None = None) -> EdgeArtifact:
-        return EdgeArtifact(edge_type, source, target, PythonGraphParser._location(node, path), evidence, snapshot, payload or {"resolution": "static"})
+        return EdgeArtifact(
+            edge_type, source, target, PythonGraphParser._location(node, path), evidence, snapshot,
+            {
+                "resolution": "static",
+                "language": "python",
+                "extraction_method": "ast",
+                "evidence_level": "observed",
+                "parse_quality": "complete",
+                **(payload or {}),
+            },
+        )
 
     @staticmethod
     def _location(node: ast.AST, path: Path) -> SourceLocation:

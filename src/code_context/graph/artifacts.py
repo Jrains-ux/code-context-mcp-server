@@ -56,8 +56,20 @@ class EdgeArtifact:
 
 
 @dataclass(frozen=True)
+class GraphDiagnostic:
+    code: str
+    path: str
+    message: str
+    detail: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        object.__setattr__(self, "detail", MappingProxyType(dict(self.detail)))
+
+
+@dataclass(frozen=True)
 class GraphArtifact:
     nodes: tuple[NodeArtifact, ...]
     edges: tuple[EdgeArtifact, ...]
     source_revision: str
     snapshot_revision: str
+    diagnostics: tuple[GraphDiagnostic, ...] = ()
