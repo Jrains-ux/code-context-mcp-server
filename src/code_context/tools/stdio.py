@@ -28,6 +28,9 @@ class StdioDispatcher:
         "knowledge-generate": "Generate a versioned knowledge artifact.",
         "knowledge-push": "Push a knowledge artifact to a configured target.",
         "confirm": "Confirm or reject a business mapping with evidence and CAS.",
+        "mine": "Persist deterministic business mapping candidates.",
+        "resolve_business_context": "Resolve a business term to version-bound contexts.",
+        "select_business_context": "Select a context from a route token.",
     }
 
     _METHODS = {
